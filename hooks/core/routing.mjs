@@ -13,7 +13,7 @@
 import {
   ROUTING_BLOCK, READ_GUIDANCE, GREP_GUIDANCE, BASH_GUIDANCE, EXTERNAL_MCP_GUIDANCE,
   createRoutingBlock, createReadGuidance, createGrepGuidance, createBashGuidance,
-  createExternalMcpGuidance,
+  createExternalMcpGuidance, isWebFetchRedirectDisabled,
 } from "../routing-block.mjs";
 import { createToolNamer } from "./tool-naming.mjs";
 import { isMCPReady } from "./mcp-ready.mjs";
@@ -924,6 +924,12 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
 
   // ─── WebFetch: deny + redirect to sandbox ───
   if (canonical === "WebFetch") {
+    // #1003: operator opt-out. The redirect assumes the model will act on the
+    // deny reason; when it cannot, the fetch is lost rather than redirected.
+    // Passing through here also suppresses the redirectMeta marker, so the
+    // bytes_avoided accounting stays honest — nothing was avoided.
+    if (isWebFetchRedirectDisabled()) return null;
+
     const url = getWebFetchUrl(toolInput);
     return mcpRedirect({
       action: "deny",

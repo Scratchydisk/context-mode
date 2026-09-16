@@ -11,10 +11,40 @@
 
 import { createToolNamer } from "./core/tool-naming.mjs";
 
+// ── WebFetch redirect opt-out (#1003) ─────────────────────
+//
+// The WebFetch redirect is a *suggestion*: routing.mjs denies the call and
+// hands the model a reason string telling it to re-dispatch to
+// ctx_fetch_and_index. That closes the loop only for models which reliably act
+// on a deny. A model that cannot recover from one — a small local model behind
+// ANTHROPIC_BASE_URL, for instance — stops or retries WebFetch instead, so the
+// fetch is lost rather than redirected and the intervention degrades the answer
+// instead of saving context.
+//
+// CONTEXT_MODE_DISABLE_WEBFETCH_REDIRECT=1 passes WebFetch through untouched.
+// Scoped to WebFetch alone: the Bash/Read/Grep nudges, the curl/wget deny and
+// the inline-HTTP deny are unaffected, so those savings are retained.
+//
+// Lives here rather than in routing.mjs because routing.mjs imports this
+// module — the reverse direction would be a cycle.
+const WEBFETCH_REDIRECT_DISABLE_ENV = "CONTEXT_MODE_DISABLE_WEBFETCH_REDIRECT";
+
+export function isWebFetchRedirectDisabled(env = process.env) {
+  const raw = env[WEBFETCH_REDIRECT_DISABLE_ENV];
+  if (raw == null) return false;
+  return /^(1|true|yes|on)$/i.test(String(raw).trim());
+}
+
 // ── Factory functions ─────────────────────────────────────
 
 export function createRoutingBlock(t, options = {}) {
-  const { includeCommands = true, toolSearchBootstrap = false } = options;
+  const {
+    includeCommands = true,
+    toolSearchBootstrap = false,
+    // Omit the WebFetch line when the redirect is off, so the injected block
+    // does not tell the model to avoid a tool that now works normally.
+    includeWebFetchRedirect = !isWebFetchRedirectDisabled(),
+  } = options;
   return `
 <context_window_protection>
   <priority_instructions>
@@ -41,8 +71,8 @@ ${toolSearchBootstrap ? `
 
   <when_not_to_use>
     - You intend to PROCESS the output (filter, count, parse, aggregate) → use ${t("ctx_batch_execute")} or ${t("ctx_execute")}. Bash stays correct when you intend to OBSERVE a short fixed output (git status on a clean tree, whoami, pwd) or when you are mutating state (git, mkdir, rm, mv, navigation).
-    - You want to analyze, summarize, or extract from a file → use ${t("ctx_execute_file")}. Read stays correct when you intend to Edit the file (Edit needs the exact bytes in your conversation to match against).
-    - WebFetch → use ${t("ctx_fetch_and_index")}; full network access, results indexed for ${t("ctx_search")}, raw page bytes never enter your conversation.
+    - You want to analyze, summarize, or extract from a file → use ${t("ctx_execute_file")}. Read stays correct when you intend to Edit the file (Edit needs the exact bytes in your conversation to match against).${includeWebFetchRedirect ? `
+    - WebFetch → use ${t("ctx_fetch_and_index")}; full network access, results indexed for ${t("ctx_search")}, raw page bytes never enter your conversation.` : ''}
     - ${t("ctx_execute")} and ${t("ctx_execute_file")} for file writes → these run code in a subprocess and discard the sandbox FS; they are for analysis, processing, and computation only.
   </when_not_to_use>
 

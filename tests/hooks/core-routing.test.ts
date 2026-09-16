@@ -506,6 +506,75 @@ describe("routePreToolUse", () => {
       expect(result!.reason).toContain("ctx_fetch_and_index");
     });
 
+    describe("CONTEXT_MODE_DISABLE_WEBFETCH_REDIRECT opt-out (#1003)", () => {
+      const ENV = "CONTEXT_MODE_DISABLE_WEBFETCH_REDIRECT";
+      let saved: string | undefined;
+
+      beforeEach(() => { saved = process.env[ENV]; });
+      afterEach(() => {
+        if (saved === undefined) delete process.env[ENV];
+        else process.env[ENV] = saved;
+      });
+
+      for (const value of ["1", "true", "YES", "on"]) {
+        it(`passes WebFetch through when set to "${value}"`, () => {
+          process.env[ENV] = value;
+          const result = routePreToolUse(
+            "WebFetch",
+            { url: "https://example.com" },
+            undefined,
+            "claude-code",
+            `webfetch-optout-${value}`,
+          );
+          expect(result).toBeNull();
+        });
+      }
+
+      for (const value of ["", "0", "false", "off", "maybe"]) {
+        it(`keeps the redirect when set to "${value}"`, () => {
+          process.env[ENV] = value;
+          const result = routePreToolUse(
+            "WebFetch",
+            { url: "https://example.com" },
+            undefined,
+            "claude-code",
+            `webfetch-optout-kept-${value || "empty"}`,
+          );
+          expect(result).not.toBeNull();
+          expect(result!.action).toBe("deny");
+        });
+      }
+
+      it("leaves the curl interception in place — the opt-out is scoped to WebFetch", () => {
+        process.env[ENV] = "1";
+        const result = routePreToolUse(
+          "Bash",
+          { command: "curl https://example.com" },
+          undefined,
+          "claude-code",
+          "webfetch-optout-curl-untouched",
+        );
+        // curl is rewritten rather than denied; either way it must not pass through.
+        expect(result).not.toBeNull();
+        expect(result!.action).toBe("modify");
+      });
+
+      it("drops the WebFetch line from the injected routing block", async () => {
+        const { createRoutingBlock } = await import("../../hooks/routing-block.mjs");
+        const { createToolNamer } = await import("../../hooks/core/tool-naming.mjs");
+        const t = createToolNamer("claude-code");
+
+        const withRedirect = createRoutingBlock(t, { includeWebFetchRedirect: true });
+        expect(withRedirect).toContain("WebFetch → use");
+
+        const without = createRoutingBlock(t, { includeWebFetchRedirect: false });
+        expect(without).not.toContain("WebFetch");
+        // The surrounding section must survive intact.
+        expect(without).toContain("<when_not_to_use>");
+        expect(without).toContain("ctx_execute_file");
+      });
+    });
+
     it("Claude Code pretooluse treats subagent hook payloads as ctx_* unavailable (#794)", async () => {
       const main = await spawnPreToolUseHook({
         tool_name: "WebFetch",
