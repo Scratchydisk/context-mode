@@ -6,6 +6,30 @@
 [![Discord](https://img.shields.io/discord/1478479412700909750?label=Discord&logo=discord&color=5865f2)](https://discord.gg/DCN9jUgN5v)
 [![Hacker News #1](https://img.shields.io/badge/Hacker%20News-%231%20%E2%80%A2%20570%2B%20points-ff6600?logo=ycombinator&logoColor=white)](https://news.ycombinator.com/item?id=47193064)
 
+## About this fork
+
+This is [@Scratchydisk](https://github.com/Scratchydisk)'s maintained fork of [mksglu/context-mode](https://github.com/mksglu/context-mode), kept in sync with upstream `main` and layered with fixes that were sitting unmerged upstream (124+ open PRs, no real merge in 3 months as of writing). Nothing here has been sent back upstream except where noted — this fork exists to actually run these fixes locally, not to replace the original project.
+
+**Our own fix:**
+
+- **OpenCode 2 plugin compatibility** ([upstream PR #1171](https://github.com/mksglu/context-mode/pull/1171)) — OpenCode 2's plugin loader only recognizes `Plugin.define({ id, setup })` from `@opencode/plugin`; the published package still only exports the old OpenCode 1.x/KiloCode `{ id, server }` shape, so it silently fails to load (`PluginModule.LoadError: ... Missing key at ["default"]["setup"]`) under a real OpenCode 2 install. Adds a V2 `setup()` entrypoint alongside the untouched V1 `server()`, per OpenCode's own documented dual-export pattern — re-implements all five hooks (routing enforcement, session capture, compaction snapshot, resume injection, prompt capture) against OpenCode 2's `ctx.tool.hook`/`ctx.session.hook`/`ctx.event.subscribe`/`ctx.tool.transform` APIs. Verified against a real `opencode@2.0.4` install, including a live session that called `ctx_stats` end-to-end.
+
+**Cherry-picked from upstream's open-PR backlog** (each reviewed, verified independently, and tested against this fork before merging — see `integrate/community-fixes`):
+
+| PR | Fix |
+|---|---|
+| [#1160](https://github.com/mksglu/context-mode/pull/1160) | Writing the OpenCode plugin config no longer drops a sibling `opencode.json`/`.jsonc`'s existing plugins |
+| [#1161](https://github.com/mksglu/context-mode/pull/1161) | OpenCode/KiloCode routing guidance now references the actual native `ctx_*` tool names instead of a nonexistent `context-mode_ctx_*` prefix |
+| [#1144](https://github.com/mksglu/context-mode/pull/1144) | `ctx-debug.sh` redacts `env` blocks and credential-shaped keys with a proper JSON-aware module, not just inline regex |
+| [#1155](https://github.com/mksglu/context-mode/pull/1155) | Bug report template now warns against pasting raw credentials by hand (took only this part — its redaction-script change conflicted with #1144's more thorough fix) |
+| [#1086](https://github.com/mksglu/context-mode/pull/1086) | Fixes a command-injection exposure: the shell quote-scanner desynced on prose apostrophes ("the linter's fixtures"), letting a `curl`/`wget` mention in a commit message slip through as bare shell |
+| [#1087](https://github.com/mksglu/context-mode/pull/1087) | Fixes a fail-open security bug: permission-deny patterns anchored with `//` or `~/` silently matched nothing |
+| [#1030](https://github.com/mksglu/context-mode/pull/1030) | `SQLITE_IOERR` is now retried as transient instead of hard-failing the caller on a filesystem blip |
+| [#1056](https://github.com/mksglu/context-mode/pull/1056) | Removes a close-time WAL `TRUNCATE` checkpoint that was corrupting shared multi-process databases |
+| [#1118](https://github.com/mksglu/context-mode/pull/1118) | SQL comments in the `bun:sqlite` adapter's multi-statement `exec()` no longer split or desync statements |
+
+Every merge above was individually typechecked, built, and tested (plus a full-suite run at the end) before being kept — see commit messages on `integrate/community-fixes` for specifics.
+
 <p align="center">
 <sub>Used across teams at</sub>
 <br><br>
