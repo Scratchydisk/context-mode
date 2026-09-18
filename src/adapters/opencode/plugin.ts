@@ -32,7 +32,7 @@
 
 import { dirname, resolve, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 
 import { resolveSessionDbPath, SessionDB } from "../../session/db.js";
 import { extractEvents, extractUserEvents, parseOpencodeUsage, buildAgentUsageEvent } from "../../session/extract.js";
@@ -934,6 +934,34 @@ async function registerNativeToolsV2(
   });
 }
 
+/**
+ * Mark this process as a ready context-mode tool provider.
+ *
+ * Routing (hooks/core/routing.mjs) redirects curl/wget and large-output
+ * commands only when `isMCPReady()` finds a live readiness sentinel. The
+ * stdio MCP server writes one from its main(); with native V2 tools there is
+ * no MCP server, so without this the redirects silently depend on some
+ * unrelated context-mode MCP process (another client's) being alive. Mirrors
+ * the server's sentinel: this process's PID, refreshed every 30s (the reader's
+ * freshness window is 90s), removed on dispose.
+ */
+async function startReadinessSentinel(): Promise<() => void> {
+  const buildDir = dirname(fileURLToPath(import.meta.url));
+  const mcpReadyPath = resolve(buildDir, "..", "..", "..", "hooks", "core", "mcp-ready.mjs");
+  const { sentinelPathForPid } = await import(pathToFileURL(mcpReadyPath).href);
+  const sentinel: string = sentinelPathForPid(process.pid);
+  const write = () => {
+    try { writeFileSync(sentinel, String(process.pid)); } catch { /* best effort */ }
+  };
+  write();
+  const refresh = setInterval(write, 30_000);
+  refresh.unref();
+  return () => {
+    clearInterval(refresh);
+    try { unlinkSync(sentinel); } catch { /* best effort */ }
+  };
+}
+
 /** V2 `Plugin.define({ id, setup })` body. `ctx` is the OpenCode 2 plugin context. */
 async function setupContextModePluginV2(ctx: any): Promise<() => void> {
   const directory = ctx?.location?.directory ?? process.cwd();
@@ -943,6 +971,7 @@ async function setupContextModePluginV2(ctx: any): Promise<() => void> {
   const captureAgentsMd = makeAgentsMdCapture(projectDir, db);
 
   await registerNativeToolsV2(ctx, projectDir, toolNamer);
+  const stopReadinessSentinel = await startReadinessSentinel();
 
   // ── tool.execute.before → routing enforcement ──────────
   await ctx.tool.hook("execute.before", (event: any) => {
@@ -1115,7 +1144,10 @@ async function setupContextModePluginV2(ctx: any): Promise<() => void> {
     }
   });
 
-  return () => usageController.abort();
+  return () => {
+    usageController.abort();
+    stopReadinessSentinel();
+  };
 }
 
 // ── Exports ──────────────────────────────────────────────

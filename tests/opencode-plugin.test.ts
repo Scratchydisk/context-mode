@@ -144,6 +144,50 @@ describe("ContextModePlugin", () => {
     });
   });
 
+  // Routing (hooks/core/routing.mjs) only redirects curl/wget/large output when
+  // isMCPReady() finds a live readiness sentinel -- written by the stdio MCP
+  // server's main(). With native V2 tools there is no MCP server, so unless the
+  // plugin marks itself ready, routing silently depends on some unrelated
+  // context-mode MCP process (e.g. another client's) happening to be alive.
+  describe("OpenCode 2 readiness sentinel", () => {
+    it("V2 setup() writes a readiness sentinel for its own process and removes it on dispose", async () => {
+      const sentinelDir = mkdtempSync(join(tmpdir(), "cm-v2-sentinel-"));
+      const prev = process.env.CONTEXT_MODE_MCP_SENTINEL_DIR;
+      process.env.CONTEXT_MODE_MCP_SENTINEL_DIR = sentinelDir;
+      const sentinel = join(sentinelDir, `context-mode-mcp-ready-${process.pid}`);
+      const controller = new AbortController();
+      try {
+        await import("@opencode/plugin");
+        const mod = await import("../src/adapters/opencode/plugin.js");
+        const ctx = {
+          location: { directory: tempDir },
+          tool: { transform: async (fn: (e: unknown) => unknown) => { await fn({ add: () => {} }); }, hook: async () => {} },
+          session: { hook: async () => {} },
+          event: {
+            subscribe: () => ({
+              async *[Symbol.asyncIterator]() {
+                await new Promise((r) => controller.signal.addEventListener("abort", r, { once: true }));
+              },
+            }),
+          },
+        };
+        expect(existsSync(sentinel)).toBe(false);
+        const dispose = await (mod.default as any).setup(ctx);
+        expect(existsSync(sentinel)).toBe(true);
+        const { isMCPReady } = await import("../hooks/core/mcp-ready.mjs");
+        expect(isMCPReady()).toBe(true);
+        controller.abort();
+        await dispose();
+        expect(existsSync(sentinel)).toBe(false);
+      } finally {
+        controller.abort();
+        if (prev === undefined) delete process.env.CONTEXT_MODE_MCP_SENTINEL_DIR;
+        else process.env.CONTEXT_MODE_MCP_SENTINEL_DIR = prev;
+        rmSync(sentinelDir, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe("v2ToolIdentity", () => {
     it("maps a <prefix>_<tool> namer onto OpenCode 2's namespace option", async () => {
       const { v2ToolIdentity } = await import("../src/adapters/opencode/plugin.js");
