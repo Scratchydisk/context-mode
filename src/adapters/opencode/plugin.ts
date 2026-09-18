@@ -833,8 +833,24 @@ async function createContextModePlugin(ctx: PluginContext) {
 // session-attribution path in `tool.execute.after` should be exercised
 // against a live OpenCode 2 agent turn before release.
 
-/** Register context-mode's ctx_* tools through the V2 tool-transform API. */
-async function registerNativeToolsV2(ctx: any, projectDir: string): Promise<void> {
+/**
+ * Register context-mode's ctx_* tools through the V2 tool-transform API.
+ *
+ * Two V2-specific details, both observed on OpenCode 2.0.7:
+ * - Tools added via `editor.add` default to `codemode: true`, which hides them
+ *   from the model's direct tool list: they are only reachable by writing code
+ *   against the `execute` tool's catalog. Routing enforcement tells the model
+ *   to *call* these tools directly, so they are registered with
+ *   `codemode: false`.
+ * - They are registered under `toolNamer(name)` — the same names the routing
+ *   block and the `execute.before` redirect messages use — so the guidance the
+ *   model receives always names a tool that exists.
+ */
+async function registerNativeToolsV2(
+  ctx: any,
+  projectDir: string,
+  toolNamer: (bareTool: string) => string,
+): Promise<void> {
   const mod = await loadCtxToolRegistry();
   const zod4 = await import("zod/v4");
 
@@ -852,9 +868,10 @@ async function registerNativeToolsV2(ctx: any, projectDir: string): Promise<void
       const jsonSchema = zod4.toJSONSchema(zod4.object(v4Shape));
 
       editor.add({
-        name: registered.name,
+        name: toolNamer(registered.name),
         description: String(config.description ?? ""),
         input: jsonSchema,
+        options: { codemode: false },
         async execute(input: Record<string, unknown>) {
           let parsedArgs: Record<string, unknown> = input ?? {};
           if (typeof inputSchema?.parse === "function") {
@@ -894,12 +911,12 @@ async function registerNativeToolsV2(ctx: any, projectDir: string): Promise<void
 /** V2 `Plugin.define({ id, setup })` body. `ctx` is the OpenCode 2 plugin context. */
 async function setupContextModePluginV2(ctx: any): Promise<() => void> {
   const directory = ctx?.location?.directory ?? process.cwd();
-  const { platform, routing, autoInjectionMod, routingBlock, projectDir, db } =
+  const { platform, routing, autoInjectionMod, toolNamer, routingBlock, projectDir, db } =
     await createContextModeRuntime(directory);
 
   const captureAgentsMd = makeAgentsMdCapture(projectDir, db);
 
-  await registerNativeToolsV2(ctx, projectDir);
+  await registerNativeToolsV2(ctx, projectDir, toolNamer);
 
   // ── tool.execute.before → routing enforcement ──────────
   await ctx.tool.hook("execute.before", (event: any) => {
