@@ -86,6 +86,57 @@ describe("ContextModePlugin", () => {
       const mod = await import("../src/adapters/opencode/plugin.js");
       expect(typeof (mod.default as any).setup).toBe("function");
     });
+
+    // Runs the real V2 setup() against a minimal fake OpenCode 2 context and
+    // records what it registers. Two things only a live host exposed:
+    // - `editor.add` defaults to `codemode: true`, which keeps a tool out of the
+    //   model's direct tool list (reachable only through the `execute` tool's
+    //   catalog), while routing enforcement tells the model to call ctx_* tools
+    //   directly;
+    // - the redirect messages and routing block name tools via
+    //   `createToolNamer(platform)`, so registration must use the same names or
+    //   the model is pointed at tools that do not exist.
+    it("V2 setup() registers ctx_* tools as direct tools under the routed names", async () => {
+      await import("@opencode/plugin");
+      const mod = await import("../src/adapters/opencode/plugin.js");
+      const { createToolNamer } = await import("../hooks/core/tool-naming.mjs");
+      const namer = createToolNamer("opencode");
+
+      const added: Array<{ name: string; options?: { codemode?: boolean } }> = [];
+      const controller = new AbortController();
+      const ctx = {
+        location: { directory: tempDir },
+        tool: {
+          transform: async (fn: (editor: unknown) => void) => {
+            fn({ add: (tool: { name: string; options?: { codemode?: boolean } }) => added.push(tool) });
+          },
+          hook: async () => {},
+        },
+        session: { hook: async () => {} },
+        event: {
+          subscribe: () => ({
+            async *[Symbol.asyncIterator]() {
+              await new Promise((r) => controller.signal.addEventListener("abort", r));
+            },
+          }),
+        },
+      };
+
+      const dispose = await (mod.default as any).setup(ctx);
+      try {
+        expect(added.length).toBeGreaterThan(0);
+        for (const tool of added) {
+          expect(tool.options?.codemode).toBe(false);
+        }
+        const names = added.map((t) => t.name);
+        expect(names).toContain(namer("ctx_execute"));
+        expect(names).toContain(namer("ctx_search"));
+        expect(names.every((n) => n.startsWith(namer("")))).toBe(true);
+      } finally {
+        controller.abort();
+        if (typeof dispose === "function") await dispose();
+      }
+    });
   });
 
   // ── Factory ───────────────────────────────────────────
