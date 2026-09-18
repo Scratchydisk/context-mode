@@ -102,13 +102,14 @@ describe("ContextModePlugin", () => {
       const { createToolNamer } = await import("../hooks/core/tool-naming.mjs");
       const namer = createToolNamer("opencode");
 
-      const added: Array<{ name: string; options?: { codemode?: boolean } }> = [];
+      type Added = { name: string; options?: { codemode?: boolean; namespace?: string } };
+      const added: Added[] = [];
       const controller = new AbortController();
       const ctx = {
         location: { directory: tempDir },
         tool: {
-          transform: async (fn: (editor: unknown) => void) => {
-            fn({ add: (tool: { name: string; options?: { codemode?: boolean } }) => added.push(tool) });
+          transform: async (fn: (editor: unknown) => unknown) => {
+            await fn({ add: (tool: Added) => added.push(tool) });
           },
           hook: async () => {},
         },
@@ -116,7 +117,7 @@ describe("ContextModePlugin", () => {
         event: {
           subscribe: () => ({
             async *[Symbol.asyncIterator]() {
-              await new Promise((r) => controller.signal.addEventListener("abort", r));
+              await new Promise((r) => controller.signal.addEventListener("abort", r, { once: true }));
             },
           }),
         },
@@ -128,14 +129,36 @@ describe("ContextModePlugin", () => {
         for (const tool of added) {
           expect(tool.options?.codemode).toBe(false);
         }
-        const names = added.map((t) => t.name);
-        expect(names).toContain(namer("ctx_execute"));
-        expect(names).toContain(namer("ctx_search"));
-        expect(names.every((n) => n.startsWith(namer("")))).toBe(true);
+        // OpenCode 2 shows `<namespace>_<name>` to the model: that visible name
+        // must be exactly the routed name for every registered tool.
+        for (const tool of added) {
+          const visible = tool.options?.namespace ? `${tool.options.namespace}_${tool.name}` : tool.name;
+          expect(tool.name.startsWith("ctx_")).toBe(true);
+          expect(visible).toBe(namer(tool.name));
+        }
+        expect(added.map((t) => t.name)).toContain("ctx_execute");
       } finally {
         controller.abort();
         if (typeof dispose === "function") await dispose();
       }
+    });
+  });
+
+  describe("v2ToolIdentity", () => {
+    it("maps a <prefix>_<tool> namer onto OpenCode 2's namespace option", async () => {
+      const { v2ToolIdentity } = await import("../src/adapters/opencode/plugin.js");
+      expect(v2ToolIdentity("ctx_execute", (t) => `context-mode_${t}`)).toEqual({
+        name: "ctx_execute",
+        namespace: "context-mode",
+      });
+    });
+
+    it("uses any other namer shape verbatim, with no namespace", async () => {
+      const { v2ToolIdentity } = await import("../src/adapters/opencode/plugin.js");
+      expect(v2ToolIdentity("ctx_execute", (t) => t)).toEqual({ name: "ctx_execute" });
+      expect(v2ToolIdentity("ctx_execute", (t) => `mcp__context-mode__${t}`)).toEqual({
+        name: "mcp__context-mode__ctx_execute",
+      });
     });
   });
 

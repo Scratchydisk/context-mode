@@ -842,10 +842,33 @@ async function createContextModePlugin(ctx: PluginContext) {
  *   against the `execute` tool's catalog. Routing enforcement tells the model
  *   to *call* these tools directly, so they are registered with
  *   `codemode: false`.
- * - They are registered under `toolNamer(name)` — the same names the routing
- *   block and the `execute.before` redirect messages use — so the guidance the
- *   model receives always names a tool that exists.
+ * - Their model-visible names must equal `toolNamer(name)` — the names the
+ *   routing block and the `execute.before` redirect messages use — so the
+ *   guidance the model receives always names a tool that exists. OpenCode 2
+ *   composes the visible name as `<namespace>_<name>`, so a namer of the form
+ *   `<prefix>_<tool>` maps onto its native `namespace` option (see
+ *   `v2ToolIdentity`); any other namer shape is used verbatim as the name.
  */
+/**
+ * Split a routed tool name into OpenCode 2's `{ name, namespace }` so the
+ * host-composed `<namespace>_<name>` equals exactly what the router tells the
+ * model to call. Exported for tests.
+ */
+export function v2ToolIdentity(
+  bareTool: string,
+  toolNamer: (bareTool: string) => string,
+): { name: string; namespace?: string } {
+  const routed = toolNamer(bareTool);
+  const suffix = `_${bareTool}`;
+  if (routed.endsWith(suffix)) {
+    const namespace = routed.slice(0, -suffix.length);
+    // Only a clean `<prefix>_<tool>` shape; anything else (e.g. `mcp__x__tool`)
+    // is registered verbatim so the host never sees an odd namespace.
+    if (namespace && !namespace.endsWith("_")) return { name: bareTool, namespace };
+  }
+  return { name: routed };
+}
+
 async function registerNativeToolsV2(
   ctx: any,
   projectDir: string,
@@ -867,11 +890,14 @@ async function registerNativeToolsV2(
       const v4Shape = zod3ShapeToV4(shape) as Record<string, InstanceType<typeof zod4.ZodType>>;
       const jsonSchema = zod4.toJSONSchema(zod4.object(v4Shape));
 
+      const identity = v2ToolIdentity(registered.name, toolNamer);
       editor.add({
-        name: toolNamer(registered.name),
+        name: identity.name,
         description: String(config.description ?? ""),
         input: jsonSchema,
-        options: { codemode: false },
+        options: identity.namespace
+          ? { namespace: identity.namespace, codemode: false }
+          : { codemode: false },
         async execute(input: Record<string, unknown>) {
           let parsedArgs: Record<string, unknown> = input ?? {};
           if (typeof inputSchema?.parse === "function") {
