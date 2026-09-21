@@ -1155,27 +1155,16 @@ async function setupContextModePluginV2(ctx: any): Promise<() => void> {
 // OpenCode compat: named export for direct import("context-mode/plugin")
 //
 // OpenCode 2 support (V1/V2 dual export, per opencode.ai/v2/docs/build/
-// plugins#support-v1): spread Plugin.define(...) into the default export
-// alongside `server`. OpenCode 1.x/KiloCode call server() and ignore `id`/
-// `setup`; OpenCode 2 reads `id`/`setup` and ignores `server`. `@opencode/
-// plugin` is imported dynamically (not as a static top-level import) so a
-// missing/partial install of that dependency degrades to V1-only behavior
-// instead of breaking the whole module for existing KiloCode/OpenCode-1.x
-// users.
-async function loadV2PluginShape() {
-  try {
-    const { Plugin } = await import("@opencode/plugin");
-    return Plugin.define({
-      id: "context-mode",
-      setup: setupContextModePluginV2,
-    });
-  } catch {
-    // @opencode/plugin unavailable (older install, or a host that never loads
-    // this file's V2 path) — fall back to V1-only. Non-fatal by design.
-    return { id: "context-mode" as const };
-  }
-}
-const v2PluginShape = await loadV2PluginShape();
+// plugins#support-v1): spread the V2 shape into the default export alongside
+// `server`. OpenCode 1.x/KiloCode call server() and ignore `id`/`setup`;
+// OpenCode 2 reads `id`/`setup` and ignores `server`. This is built without
+// importing `@opencode/plugin` — `Plugin.define()` in that package is just
+// `(plugin) => plugin` (the identity function), so calling it added no
+// behavior, only a dependency that isn't guaranteed to resolve on every host
+// (#1171: `opencode plugin add` installs don't always run full dependency
+// resolution, so the dynamic import used to fail and silently drop `setup`,
+// which made OpenCode 2 reject the whole plugin).
+const v2PluginShape = { id: "context-mode" as const, setup: setupContextModePluginV2 };
 
 export default { ...v2PluginShape, server: createContextModePlugin };
 export { createContextModePlugin as ContextModePlugin };

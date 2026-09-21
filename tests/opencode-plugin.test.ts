@@ -8,7 +8,7 @@ import "./setup-home";
  *   - experimental.session.compacting (snapshot generation)
  */
 
-import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -85,6 +85,29 @@ describe("ContextModePlugin", () => {
       await import("@opencode/plugin");
       const mod = await import("../src/adapters/opencode/plugin.js");
       expect(typeof (mod.default as any).setup).toBe("function");
+    });
+
+    // #1171 (comment from imyu37, opencode 2.0.10 standalone Windows binary,
+    // installed via `opencode plugin add`): the default export shipped with
+    // only `{ id, server }`, no `setup`, so OpenCode 2 rejected it outright
+    // ("Plugin must export a default definition with an id and an effect or
+    // setup function") and the plugin silently never loaded. That shape is
+    // exactly what the old fallback produced when the dynamic
+    // `import("@opencode/plugin")` failed to resolve on the host. Since
+    // `Plugin.define()` is the identity function, the V2 shape does not
+    // depend on that import succeeding.
+    it("default export still carries a working V2 setup() when @opencode/plugin fails to resolve", async () => {
+      vi.resetModules();
+      vi.doMock("@opencode/plugin", () => {
+        throw new Error("Cannot find module '@opencode/plugin'");
+      });
+      try {
+        const mod = await import("../src/adapters/opencode/plugin.js");
+        expect(typeof (mod.default as any).setup).toBe("function");
+      } finally {
+        vi.doUnmock("@opencode/plugin");
+        vi.resetModules();
+      }
     });
 
     // Runs the real V2 setup() against a minimal fake OpenCode 2 context and
