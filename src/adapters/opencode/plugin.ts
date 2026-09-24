@@ -496,8 +496,10 @@ async function createContextModePlugin(ctx: PluginContext) {
             }
           }
 
-          const result = await mod.withProjectDirOverride({ projectDir: project, sessionId: toolCtx.sessionID }, async () =>
-            registered.handler(parsedArgs),
+          const result = await withPinnedPlatform(platform, () =>
+            mod.withProjectDirOverride({ projectDir: project, sessionId: toolCtx.sessionID }, async () =>
+              registered.handler(parsedArgs),
+            ),
           );
 
           const r = result as {
@@ -885,6 +887,35 @@ export function destructivePolicyAllows(name: string): boolean {
 }
 
 /**
+ * Pin platform detection for in-plugin tool execution (jfayad, #1171).
+ *
+ * Inside an OpenCode/KiloCode plugin host process none of the `OPENCODE_*` /
+ * `KILO_*` env markers are guaranteed to be set, so `detectPlatform()` falls
+ * through to config-dir fallbacks (`~/.claude`, `~/.gemini`, …) and tools like
+ * `ctx_doctor` misreport the platform. The plugin already knows its platform
+ * (see `getPlatform()` / `createContextModeRuntime`), so pin it via the
+ * `CONTEXT_MODE_PLATFORM` override that `detectPlatform()` honors — scoped to
+ * the handler call only.
+ *
+ * An explicit user-set `CONTEXT_MODE_PLATFORM` wins and is left untouched.
+ * Note: the pin is process-global env, so genuinely concurrent tool executions
+ * share it — same trade-off as the existing `CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS`
+ * scoping in `loadCtxToolRegistry()`. In practice the value pinned here is
+ * always this host's own platform, so interleaving is harmless.
+ */
+export async function withPinnedPlatform<T>(platform: string, fn: () => Promise<T>): Promise<T> {
+  const key = "CONTEXT_MODE_PLATFORM";
+  const prev = process.env[key];
+  const owned = prev === undefined || prev === "";
+  if (owned) process.env[key] = platform;
+  try {
+    return await fn();
+  } finally {
+    if (owned) delete process.env[key];
+  }
+}
+
+/**
  * V2 compaction posture, configurable via the plugin's `options.compaction`
  * (ported from mksglu/context-mode#1194).
  *
@@ -906,11 +937,12 @@ async function registerNativeToolsV2(
   ctx: any,
   projectDir: string,
   toolNamer: (bareTool: string) => string,
-): Promise<void> {
+  platform: string,
+): Promise<{ dispose: () => Promise<void> }> {
   const mod = await loadCtxToolRegistry();
   const zod4 = await import("zod/v4");
 
-  await ctx.tool.transform((editor: any) => {
+  return ctx.tool.transform((editor: any) => {
     for (const registered of mod.REGISTERED_CTX_TOOLS) {
       const config = registered.config as Record<string, unknown>;
       const inputSchema = config.inputSchema as
@@ -950,8 +982,10 @@ async function registerNativeToolsV2(
             }
           }
 
-          const result = await mod.withProjectDirOverride({ projectDir }, async () =>
-            registered.handler(parsedArgs),
+          const result = await withPinnedPlatform(platform, () =>
+            mod.withProjectDirOverride({ projectDir }, async () =>
+              registered.handler(parsedArgs),
+            ),
           );
 
           const r = result as {
@@ -1017,11 +1051,32 @@ async function setupContextModePluginV2(ctx: any): Promise<() => void> {
   // "passthrough" leaves `result` unset so the host model narrates.
   const compactionMode = resolveCompactionMode((ctx as any)?.options?.compaction);
 
-  await registerNativeToolsV2(ctx, projectDir, toolNamer);
-  const stopReadinessSentinel = await startReadinessSentinel();
+  // Every hook/transform registration returns a `{ dispose }` Registration
+  // per the SDK — collect them so setup failure AND plugin cleanup release
+  // what was acquired instead of leaking stale hooks into the host. Fake
+  // hosts in tests may return undefined; only real registrations are tracked.
+  const disposers: Array<() => Promise<void>> = [];
+  const track = (reg: unknown): void => {
+    const dispose = (reg as { dispose?: unknown })?.dispose;
+    if (typeof dispose === "function") disposers.push(dispose as () => Promise<void>);
+  };
+  const teardownRegistrations = async (): Promise<void> => {
+    for (const dispose of disposers.splice(0)) {
+      try {
+        await dispose();
+      } catch {
+        // Best-effort teardown — never break cleanup.
+      }
+    }
+  };
 
-  // ── tool.execute.before → routing enforcement ──────────
-  await ctx.tool.hook("execute.before", (event: any) => {
+  const usageController = new AbortController();
+
+  track(await registerNativeToolsV2(ctx, projectDir, toolNamer, platform));
+  const stopReadinessSentinel = await startReadinessSentinel();
+  try {
+    // ── tool.execute.before → routing enforcement ──────────
+    track(await ctx.tool.hook("execute.before", (event: any) => {
     const toolName = event?.tool ?? "";
     const toolInput = event?.input ?? {};
 
@@ -1042,10 +1097,10 @@ async function setupContextModePluginV2(ctx: any): Promise<() => void> {
     if (decision.action === "context" && decision.additionalContext && event?.input) {
       event.input.additionalContext = decision.additionalContext;
     }
-  });
+  }));
 
   // ── tool.execute.after → session event capture ─────────
-  await ctx.tool.hook("execute.after", async (event: any) => {
+  track(await ctx.tool.hook("execute.after", async (event: any) => {
     const sessionId = event?.sessionID;
     if (!sessionId) return;
     try {
@@ -1077,15 +1132,15 @@ async function setupContextModePluginV2(ctx: any): Promise<() => void> {
     } catch {
       // Silent — session capture must never break the tool call
     }
-  });
+  }));
 
   // ── ctx.event.subscribe → per-step / per-turn token + cost capture ─
   // v2 bus correlation (ported from mksglu/context-mode#1194): the model is
   // observed on `session.step.started` keyed by `assistantMessageID`, and the
   // matching `session.step.ended` (which omits the model) is attributed via
   // that key. The legacy `message.updated` path is kept as a fallback for
-  // hosts that still emit it.
-  const usageController = new AbortController();
+  // hosts that still emit it (note: it is absent from the v2 bus schema, so
+  // on OpenCode 2 the step correlation above is the live path).
   const modelByMessage = new Map<string, string>();
   void (async () => {
     try {
@@ -1146,7 +1201,7 @@ async function setupContextModePluginV2(ctx: any): Promise<() => void> {
   })();
 
   // ── chat.message → session "prompt" hook ────────────────
-  await ctx.session.hook("prompt", (event: any) => {
+  track(await ctx.session.hook("prompt", (event: any) => {
     const sessionId = event?.sessionID;
     if (!sessionId) return;
     try {
@@ -1171,7 +1226,7 @@ async function setupContextModePluginV2(ctx: any): Promise<() => void> {
     } catch {
       // Silent — prompt admission must never fail because of capture
     }
-  });
+  }));
 
   // ── experimental.session.compacting → session "compaction" hook ─
   // "own" (default, ported from mksglu/context-mode#1194): supplying `result`
@@ -1180,7 +1235,7 @@ async function setupContextModePluginV2(ctx: any): Promise<() => void> {
   // host model narrates; the snapshot is still persisted for cross-session
   // resume via the `context` hook. An empty snapshot leaves `result` unset in
   // either mode so the host performs its normal compaction.
-  await ctx.session.hook("compaction", async (event: any) => {
+  track(await ctx.session.hook("compaction", async (event: any) => {
     const sessionId = event?.sessionID;
     if (!sessionId) return;
     try {
@@ -1215,10 +1270,10 @@ async function setupContextModePluginV2(ctx: any): Promise<() => void> {
     } catch {
       // Silent — never break compaction
     }
-  });
+  }));
 
   // ── experimental.chat.system.transform → session "context" hook ─
-  await ctx.session.hook("context", (event: any) => {
+  track(await ctx.session.hook("context", (event: any) => {
     const sessionId = event?.sessionID;
     if (!sessionId || !Array.isArray(event?.system)) return;
 
@@ -1241,11 +1296,19 @@ async function setupContextModePluginV2(ctx: any): Promise<() => void> {
     } catch {
       // Silent — never break the chat turn
     }
-  });
-
-  return () => {
+  }));
+  } catch (err) {
+    // A failed registration must not leave the earlier hooks behind.
     usageController.abort();
     stopReadinessSentinel();
+    await teardownRegistrations();
+    throw err;
+  }
+
+  return async () => {
+    usageController.abort();
+    stopReadinessSentinel();
+    await teardownRegistrations();
   };
 }
 
