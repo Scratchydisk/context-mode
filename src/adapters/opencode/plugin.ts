@@ -35,7 +35,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 
 import { resolveSessionDbPath, SessionDB } from "../../session/db.js";
-import { extractEvents, extractUserEvents, parseOpencodeUsage, buildAgentUsageEvent } from "../../session/extract.js";
+import { extractEvents, extractUserEvents, parseOpencodeUsage, parseOpencodeV2StepUsage, buildAgentUsageEvent } from "../../session/extract.js";
 import type { HookInput } from "../../session/extract.js";
 import { buildResumeSnapshot } from "../../session/snapshot.js";
 import type { SessionEvent } from "../../types.js";
@@ -869,6 +869,39 @@ export function v2ToolIdentity(
   return { name: routed };
 }
 
+/**
+ * Destructive tools the V2 host cannot gate per call (ported from
+ * mksglu/context-mode#1194). A plugin tool cannot raise a host permission
+ * request, so context-mode owns their in-execute policy: refused by default,
+ * opt in via `CONTEXT_MODE_ALLOW_DESTRUCTIVE=1`. Non-destructive tools are
+ * always allowed.
+ */
+const DESTRUCTIVE_TOOLS = new Set(["ctx_purge", "ctx_upgrade"]);
+
+export function destructivePolicyAllows(name: string): boolean {
+  if (!DESTRUCTIVE_TOOLS.has(name)) return true;
+  const flag = (process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE ?? "").trim().toLowerCase();
+  return flag === "1" || flag === "true" || flag === "yes";
+}
+
+/**
+ * V2 compaction posture, configurable via the plugin's `options.compaction`
+ * (ported from mksglu/context-mode#1194).
+ *
+ * - "own" (default): the DB snapshot becomes the compaction summary
+ *   (`event.result = { summary }`), so the host's model summarization call is
+ *   skipped — deterministic and model-cost-free.
+ * - "passthrough" (alias "host"): `result` is left unset so the host model
+ *   narrates its own summary. The snapshot is still persisted, so a *different*
+ *   resumed session claims it via the `context` hook (cross-session resume).
+ */
+export type CompactionMode = "own" | "passthrough";
+
+export function resolveCompactionMode(raw: unknown): CompactionMode {
+  const v = String(raw ?? "").trim().toLowerCase();
+  return v === "passthrough" || v === "host" ? "passthrough" : "own";
+}
+
 async function registerNativeToolsV2(
   ctx: any,
   projectDir: string,
@@ -899,6 +932,14 @@ async function registerNativeToolsV2(
           ? { namespace: identity.namespace, codemode: false }
           : { codemode: false },
         async execute(input: Record<string, unknown>) {
+          if (!destructivePolicyAllows(registered.name)) {
+            // Context-mode-owned refusal — the V2 host cannot gate plugin tools
+            // per call, so this decision is ours, never a host permission denial.
+            throw new Error(
+              `ctx tool "${registered.name}" is disabled by context-mode policy. ` +
+                `Set CONTEXT_MODE_ALLOW_DESTRUCTIVE=1 to enable.`,
+            );
+          }
           let parsedArgs: Record<string, unknown> = input ?? {};
           if (typeof inputSchema?.parse === "function") {
             try {
@@ -970,6 +1011,12 @@ async function setupContextModePluginV2(ctx: any): Promise<() => void> {
 
   const captureAgentsMd = makeAgentsMdCapture(projectDir, db);
 
+  // Compaction posture from the V2 plugin's `options.compaction` (ported from
+  // mksglu/context-mode#1194): "own" (default) makes the DB snapshot the
+  // compaction summary and skips the host's model summarization call;
+  // "passthrough" leaves `result` unset so the host model narrates.
+  const compactionMode = resolveCompactionMode((ctx as any)?.options?.compaction);
+
   await registerNativeToolsV2(ctx, projectDir, toolNamer);
   const stopReadinessSentinel = await startReadinessSentinel();
 
@@ -1032,13 +1079,53 @@ async function setupContextModePluginV2(ctx: any): Promise<() => void> {
     }
   });
 
-  // ── ctx.event.subscribe → per-turn token + cost capture ─
+  // ── ctx.event.subscribe → per-step / per-turn token + cost capture ─
+  // v2 bus correlation (ported from mksglu/context-mode#1194): the model is
+  // observed on `session.step.started` keyed by `assistantMessageID`, and the
+  // matching `session.step.ended` (which omits the model) is attributed via
+  // that key. The legacy `message.updated` path is kept as a fallback for
+  // hosts that still emit it.
   const usageController = new AbortController();
+  const modelByMessage = new Map<string, string>();
   void (async () => {
     try {
       for await (const busEvent of ctx.event.subscribe({ signal: usageController.signal }) as AsyncIterable<any>) {
         try {
-          if (!busEvent || busEvent.type !== "message.updated") continue;
+          if (!busEvent || typeof busEvent.type !== "string") continue;
+
+          if (busEvent.type === "session.step.started") {
+            const data = busEvent.data as
+              | { assistantMessageID?: unknown; model?: { id?: unknown; providerID?: unknown } }
+              | undefined;
+            const msgId = data?.assistantMessageID;
+            const model = data?.model;
+            if (typeof msgId === "string" && model) {
+              const id = typeof model.id === "string" ? model.id : "";
+              const providerID = typeof model.providerID === "string" ? model.providerID : "";
+              modelByMessage.set(msgId, providerID && id ? `${providerID}/${id}` : id || providerID);
+            }
+            continue;
+          }
+
+          if (busEvent.type === "session.step.ended") {
+            const data = busEvent.data as
+              | { sessionID?: unknown; assistantMessageID?: unknown }
+              | undefined;
+            const sessionId = data?.sessionID;
+            if (!sessionId || typeof sessionId !== "string") continue;
+            const msgId = typeof data?.assistantMessageID === "string" ? data.assistantMessageID : "";
+            const counts = parseOpencodeV2StepUsage(data, modelByMessage.get(msgId) ?? "");
+            if (msgId) modelByMessage.delete(msgId);
+            if (!counts) continue;
+            const usageEvent = buildAgentUsageEvent(counts);
+            if (!usageEvent) continue;
+
+            db.ensureSession(sessionId, projectDir);
+            db.insertEvent(sessionId, usageEvent, "StepEnded");
+            continue;
+          }
+
+          if (busEvent.type !== "message.updated") continue;
           const sessionId = busEvent.properties?.info?.sessionID;
           if (!sessionId || typeof sessionId !== "string") continue;
 
@@ -1087,9 +1174,15 @@ async function setupContextModePluginV2(ctx: any): Promise<() => void> {
   });
 
   // ── experimental.session.compacting → session "compaction" hook ─
+  // "own" (default, ported from mksglu/context-mode#1194): supplying `result`
+  // makes the DB snapshot the compaction summary and the host skips its model
+  // summarization call entirely. "passthrough": `result` stays unset so the
+  // host model narrates; the snapshot is still persisted for cross-session
+  // resume via the `context` hook. An empty snapshot leaves `result` unset in
+  // either mode so the host performs its normal compaction.
   await ctx.session.hook("compaction", async (event: any) => {
     const sessionId = event?.sessionID;
-    if (!sessionId || !Array.isArray(event?.system)) return;
+    if (!sessionId) return;
     try {
       db.ensureSession(sessionId, projectDir);
       const dbEvents = db.getEvents(sessionId);
@@ -1103,15 +1196,21 @@ async function setupContextModePluginV2(ctx: any): Promise<() => void> {
       db.upsertResume(sessionId, snapshot, dbEvents.length);
       db.incrementCompactCount(sessionId);
 
-      event.system.push({ type: "text", text: snapshot });
+      if (compactionMode === "own" && snapshot && snapshot.trim().length > 0) {
+        event.result = { summary: snapshot };
+      }
 
-      try {
-        const autoBlock: string = autoInjectionMod.buildAutoInjection(dbEvents);
-        if (autoBlock && autoBlock.length > 0) {
-          event.system.push({ type: "text", text: autoBlock });
+      if (Array.isArray(event?.system)) {
+        event.system.push({ type: "text", text: snapshot });
+
+        try {
+          const autoBlock: string = autoInjectionMod.buildAutoInjection(dbEvents);
+          if (autoBlock && autoBlock.length > 0) {
+            event.system.push({ type: "text", text: autoBlock });
+          }
+        } catch {
+          // Auto-injection failure must NOT break the snapshot path.
         }
-      } catch {
-        // Auto-injection failure must NOT break the snapshot path.
       }
     } catch {
       // Silent — never break compaction

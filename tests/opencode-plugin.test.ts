@@ -233,6 +233,249 @@ describe("ContextModePlugin", () => {
     });
   });
 
+  // ── V2 compaction ownership + destructive policy + step usage (#1194 port) ──
+
+  describe("OpenCode 2 compaction ownership", () => {
+    it("resolveCompactionMode defaults to own, honors passthrough/host", async () => {
+      const { resolveCompactionMode } = await import("../src/adapters/opencode/plugin.js");
+      expect(resolveCompactionMode(undefined)).toBe("own");
+      expect(resolveCompactionMode("")).toBe("own");
+      expect(resolveCompactionMode("bogus")).toBe("own");
+      expect(resolveCompactionMode("passthrough")).toBe("passthrough");
+      expect(resolveCompactionMode("host")).toBe("passthrough");
+      expect(resolveCompactionMode("HOST")).toBe("passthrough");
+    });
+
+    // Builds a fake V2 host ctx capturing registrations; `busEvents` feeds
+    // ctx.event.subscribe. Each test uses its own project dir for DB isolation.
+    async function setupV2Harness(projectDir: string, opts: { compaction?: unknown; busEvents?: unknown[] } = {}) {
+      const mod = await import("../src/adapters/opencode/plugin.js");
+      const added: Array<{ name: string; options?: Record<string, unknown>; execute?: (input: unknown) => Promise<unknown> }> = [];
+      const toolHooks: Record<string, (...args: never[]) => unknown> = {};
+      const sessionHooks: Record<string, (...args: never[]) => unknown> = {};
+      const controller = new AbortController();
+      const busEvents = opts.busEvents ?? [];
+      const ctx = {
+        location: { directory: projectDir },
+        options: opts.compaction === undefined ? {} : { compaction: opts.compaction },
+        tool: {
+          transform: async (fn: (editor: unknown) => unknown) => {
+            await fn({ add: (tool: (typeof added)[number]) => added.push(tool) });
+          },
+          hook: async (name: string, fn: (...args: never[]) => unknown) => { toolHooks[name] = fn; },
+        },
+        session: {
+          hook: async (name: string, fn: (...args: never[]) => unknown) => { sessionHooks[name] = fn; },
+          get: async () => undefined,
+        },
+        event: {
+          subscribe: () => ({
+            async *[Symbol.asyncIterator]() {
+              for (const ev of busEvents) yield ev;
+              await new Promise((r) => controller.signal.addEventListener("abort", r, { once: true }));
+            },
+          }),
+        },
+      };
+      const dispose = await (mod.default as unknown as { setup: (c: unknown) => Promise<() => void> }).setup(ctx);
+      return { added, toolHooks, sessionHooks, controller, dispose };
+    }
+
+    async function seedReadEvent(toolHooks: Record<string, (...args: never[]) => unknown>, sessionId: string) {
+      await (toolHooks["execute.after"] as unknown as (ev: unknown) => Promise<void>)({
+        sessionID: sessionId,
+        tool: "Read",
+        input: { file_path: "/src/index.ts" },
+        result: "export default {}",
+      });
+    }
+
+    it("own mode (default): compaction sets event.result.summary, skipping the host model call", async () => {
+      const projectDir = join(tempDir, `v2-compact-own-${Date.now()}`);
+      const { sessionHooks, toolHooks, controller, dispose } = await setupV2Harness(projectDir);
+      try {
+        await seedReadEvent(toolHooks, "v2-own-session");
+        const event: { sessionID: string; system: unknown[]; result?: unknown } = {
+          sessionID: "v2-own-session",
+          system: [],
+        };
+        await (sessionHooks["compaction"] as unknown as (ev: unknown) => Promise<void>)(event);
+        const result = event.result as { summary?: string };
+        expect(result?.summary).toContain("session_resume");
+        expect(result?.summary).toContain("index.ts");
+        expect(event.system.length).toBeGreaterThan(0);
+      } finally {
+        controller.abort();
+        await dispose();
+      }
+    });
+
+    it("passthrough mode: compaction leaves result unset so the host narrates", async () => {
+      const projectDir = join(tempDir, `v2-compact-pass-${Date.now()}`);
+      const { sessionHooks, toolHooks, controller, dispose } = await setupV2Harness(projectDir, {
+        compaction: "passthrough",
+      });
+      try {
+        await seedReadEvent(toolHooks, "v2-pass-session");
+        const event: { sessionID: string; system: unknown[]; result?: unknown } = {
+          sessionID: "v2-pass-session",
+          system: [],
+        };
+        await (sessionHooks["compaction"] as unknown as (ev: unknown) => Promise<void>)(event);
+        expect(event.result).toBeUndefined();
+        // Snapshot still persisted for cross-session resume.
+        expect(event.system.length).toBeGreaterThan(0);
+      } finally {
+        controller.abort();
+        await dispose();
+      }
+    });
+
+    it("empty session: result unset in either mode", async () => {
+      const projectDir = join(tempDir, `v2-compact-empty-${Date.now()}`);
+      const { sessionHooks, controller, dispose } = await setupV2Harness(projectDir);
+      try {
+        const event: { sessionID: string; system: unknown[]; result?: unknown } = {
+          sessionID: "v2-empty-session",
+          system: [],
+        };
+        await (sessionHooks["compaction"] as unknown as (ev: unknown) => Promise<void>)(event);
+        expect(event.result).toBeUndefined();
+      } finally {
+        controller.abort();
+        await dispose();
+      }
+    });
+  });
+
+  describe("OpenCode 2 destructive-tool policy", () => {
+    it("destructivePolicyAllows refuses purge/upgrade by default, allows with opt-in", async () => {
+      const { destructivePolicyAllows } = await import("../src/adapters/opencode/plugin.js");
+      const prev = process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
+      try {
+        delete process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
+        expect(destructivePolicyAllows("ctx_purge")).toBe(false);
+        expect(destructivePolicyAllows("ctx_upgrade")).toBe(false);
+        expect(destructivePolicyAllows("ctx_stats")).toBe(true);
+        expect(destructivePolicyAllows("ctx_search")).toBe(true);
+        process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE = "1";
+        expect(destructivePolicyAllows("ctx_purge")).toBe(true);
+        process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE = "yes";
+        expect(destructivePolicyAllows("ctx_upgrade")).toBe(true);
+      } finally {
+        if (prev === undefined) delete process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
+        else process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE = prev;
+      }
+    });
+
+    it("V2-registered ctx_purge execute refuses before reaching the handler", async () => {
+      const mod = await import("../src/adapters/opencode/plugin.js");
+      const added: Array<{ name: string; execute?: (input: unknown) => Promise<unknown> }> = [];
+      const controller = new AbortController();
+      const prev = process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
+      delete process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
+      try {
+        const ctx = {
+          location: { directory: join(tempDir, `v2-destructive-${Date.now()}`) },
+          tool: {
+            transform: async (fn: (editor: unknown) => unknown) => {
+              await fn({ add: (tool: (typeof added)[number]) => added.push(tool) });
+            },
+            hook: async () => {},
+          },
+          session: { hook: async () => {} },
+          event: {
+            subscribe: () => ({
+              async *[Symbol.asyncIterator]() {
+                await new Promise((r) => controller.signal.addEventListener("abort", r, { once: true }));
+              },
+            }),
+          },
+        };
+        const dispose = await (mod.default as unknown as { setup: (c: unknown) => Promise<() => void> }).setup(ctx);
+        try {
+          const purge = added.find((t) => t.name === "ctx_purge");
+          expect(purge).toBeDefined();
+          await expect(purge!.execute!({})).rejects.toThrow(/disabled by context-mode policy/);
+        } finally {
+          controller.abort();
+          await dispose();
+        }
+      } finally {
+        if (prev === undefined) delete process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
+        else process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE = prev;
+      }
+    });
+  });
+
+  describe("OpenCode 2 step usage capture", () => {
+    it("correlates session.step.started model with step.ended usage into the session DB", async () => {
+      const mod = await import("../src/adapters/opencode/plugin.js");
+      const { OpenCodeAdapter } = await import("../src/adapters/opencode/index.js");
+      const { resolveSessionDbPath, SessionDB } = await import("../src/session/db.js");
+      const projectDir = join(tempDir, `v2-usage-${Date.now()}`);
+      const sessionId = "v2-usage-session";
+      const busEvents = [
+        {
+          type: "session.step.started",
+          data: { assistantMessageID: "msg-1", model: { id: "claude-sonnet-4", providerID: "anthropic" } },
+        },
+        {
+          type: "session.step.ended",
+          data: {
+            sessionID: sessionId,
+            assistantMessageID: "msg-1",
+            tokens: { input: 100, output: 50, reasoning: 25, cache: { read: 10, write: 5 } },
+            cost: 0.0042,
+          },
+        },
+      ];
+      const added: unknown[] = [];
+      const controller = new AbortController();
+      let consumed = 0;
+      const ctx = {
+        location: { directory: projectDir },
+        tool: {
+          transform: async (fn: (editor: unknown) => unknown) => {
+            await fn({ add: (tool: unknown) => added.push(tool) });
+          },
+          hook: async () => {},
+        },
+        session: { hook: async () => {} },
+        event: {
+          subscribe: () => ({
+            async *[Symbol.asyncIterator]() {
+              for (const ev of busEvents) { consumed += 1; yield ev; }
+              await new Promise((r) => controller.signal.addEventListener("abort", r, { once: true }));
+            },
+          }),
+        },
+      };
+      const dispose = await (mod.default as unknown as { setup: (c: unknown) => Promise<() => void> }).setup(ctx);
+      try {
+        await new Promise((r) => setTimeout(r, 500));
+        expect(consumed).toBe(2);
+        const adapter = new OpenCodeAdapter("opencode");
+        const db = new SessionDB({
+          dbPath: resolveSessionDbPath({ projectDir, sessionsDir: adapter.getSessionDir() }),
+        });
+        const events = db.getEvents(sessionId);
+        const usage = events.filter((e) => (e as { type?: string }).type === "agent_usage");
+        expect(usage.length).toBeGreaterThan(0);
+        // Stored rows carry the colon-string summary (model_id lives on the
+        // built event, pinned at parser level): reasoning folded into output,
+        // native cost verbatim.
+        const first = usage[0] as unknown as { data?: unknown };
+        const data = String(first.data ?? "");
+        expect(data).toContain("tokens_out:75");
+        expect(data).toContain("cost_usd:0.0042");
+      } finally {
+        controller.abort();
+        await dispose();
+      }
+    });
+  });
+
   // ── Factory ───────────────────────────────────────────
 
   describe("factory", () => {

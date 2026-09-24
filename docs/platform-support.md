@@ -179,6 +179,41 @@ OpenCode uses a TypeScript plugin paradigm instead of JSON stdin/stdout. Hooks a
 **Cross-session resume:**
 When OpenCode triggers `experimental.session.compacting` (auto on context overflow OR manual `/compact`), context-mode saves a snapshot to its per-project SQLite store. The NEXT new session in the same project — typically after `Ctrl+D` then re-running `opencode`, or starting a fresh chat — claims that snapshot via `experimental.chat.system.transform` and prepends it to `system[1]` (preserves OpenCode's `[header, body]` cache fold). The current session never claims its OWN snapshot back (self-injection guard, v1.0.106). To verify the injection landed, run with `OPENCODE_DEBUG=1` and grep for `<!-- context-mode v` in the system prompt — that's the visible marker.
 
+### OpenCode 2 (Dual Support)
+
+**Status:** Supported — one package serves both generations. The default export carries both entrypoints: OpenCode 1.x / KiloCode call `server()`, OpenCode 2 calls `setup()` and ignores `server()`. The V1 path is unchanged.
+
+**Config key (V2):** the `plugins` array (plural), not the V1 `plugin` array. Template: `configs/opencode/opencode-v2.json`.
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["context-mode"]
+}
+```
+
+**Hook mapping (V1 → V2):**
+
+| V1 hook | V2 hook |
+| --- | --- |
+| `tool` (register) | `ctx.tool.transform` (add, `codemode: false`, routed names) |
+| `tool.execute.before` / `.after` | `ctx.tool.hook("execute.before" / "execute.after")` |
+| `chat.message` | `ctx.session.hook("prompt")` |
+| `experimental.session.compacting` | `ctx.session.hook("compaction")` |
+| `experimental.chat.system.transform` | `ctx.session.hook("context")` |
+| `event` (`message.updated`) | `ctx.event.subscribe()` (`session.step.ended` + `message.updated` fallback) |
+
+**Compaction ownership:** in the default `own` mode, the compaction hook sets `event.result = { summary }` to the DB snapshot, so the host skips its model summarization call entirely — zero LLM calls. Configure via the plugin entry's `options.compaction`:
+
+| Value | Behavior |
+|-------|----------|
+| `own` (default) | DB snapshot **is** the summary; model summarization **skipped**. |
+| `passthrough` (alias `host`) | `result` left unset; host model narrates. Snapshot still persisted for cross-session resume. |
+
+**Destructive-tool policy (V2):** the V2 host performs no per-call permission prompt for plugin tools, so `ctx_purge` / `ctx_upgrade` refuse by default inside `execute`. Opt in with `CONTEXT_MODE_ALLOW_DESTRUCTIVE=1`.
+
+**Usage capture (V2):** per-step tokens + cost from `session.step.ended`, with the model correlated from the matching `session.step.started` by `assistantMessageID`. Native USD cost passes through verbatim; `reasoning` tokens fold into output. `message.updated` remains as a fallback.
+
 **Known Issues / Caveats:**
 - SessionStart is broken (issue #14808, no hook issue #5409) — we use `experimental.chat.system.transform` as a surrogate
 - Output modification has TUI rendering bug for bash tool (issue #13575)
