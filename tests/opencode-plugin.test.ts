@@ -79,23 +79,27 @@ describe("ContextModePlugin", () => {
     });
 
     it("default export also carries a V2 setup() when @opencode/plugin is installed", async () => {
-      // Confirms the dual-export path actually ran Plugin.define(...) rather
-      // than silently falling back to V1-only (e.g. because the dependency
-      // failed to resolve in this test environment).
+      // Confirms the dual-export carries `setup` (built inline, no dependency
+      // on `@opencode/plugin` resolving).
       await import("@opencode/plugin");
       const mod = await import("../src/adapters/opencode/plugin.js");
       expect(typeof (mod.default as any).setup).toBe("function");
     });
 
-    // #1171 (comment from imyu37, opencode 2.0.10 standalone Windows binary,
-    // installed via `opencode plugin add`): the default export shipped with
-    // only `{ id, server }`, no `setup`, so OpenCode 2 rejected it outright
+    // #1171: two distinct shapes produce the same OpenCode 2 rejection
     // ("Plugin must export a default definition with an id and an effect or
-    // setup function") and the plugin silently never loaded. That shape is
-    // exactly what the old fallback produced when the dynamic
-    // `import("@opencode/plugin")` failed to resolve on the host. Since
-    // `Plugin.define()` is the identity function, the V2 shape does not
-    // depend on that import succeeding.
+    // setup function"):
+    // - Published `context-mode@1.0.169` (imyu37, opencode 2.0.10 Windows,
+    //   `opencode plugin add`): V2 export entirely absent. Entry ends with
+    //   `export default { id, server }`, no `setup`, no `@opencode/plugin`
+    //   reference. Fixed by merging/releasing this PR.
+    // - Pre-fix branch: V2 shape built via dynamic `import("@opencode/plugin")`
+    //   → `Plugin.define({ id, setup })`. Since `Plugin.define()` is the
+    //   identity function, the import added no behavior, only a resolution
+    //   failure mode that silently fell back to V1-only. Hardened here by
+    //   building `{ id, setup }` inline with no import.
+    // This test locks the hardening: `setup` stays present even when
+    // `@opencode/plugin` fails to resolve.
     it("default export still carries a working V2 setup() when @opencode/plugin fails to resolve", async () => {
       vi.resetModules();
       vi.doMock("@opencode/plugin", () => {
