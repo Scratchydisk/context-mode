@@ -101,12 +101,16 @@ scripts/install-fork.sh --dir "$PWD"
 scripts/install-fork.sh
 ```
 
-Then, once per machine:
+That is the whole setup. The installer clones and builds the fork, installs it globally, points
+`/ctx-upgrade` at the fork, and then runs `context-mode upgrade` for each platform it finds —
+which is what writes the OpenCode 2 `plugins` entry and repoints Claude Code's marketplace
+registry. Afterwards:
 
 ```bash
-context-mode upgrade      # wires the hooks and the OpenCode 2 config
 context-mode doctor       # verify
 ```
+
+Restart OpenCode afterwards so it picks up the plugin.
 
 The installer writes `~/.context-mode/fork.json`:
 
