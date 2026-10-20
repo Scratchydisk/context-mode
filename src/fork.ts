@@ -7,7 +7,7 @@
 //
 // Resolution order: environment variable → ~/.context-mode/fork.json → the upstream default.
 // scripts/install-fork.sh writes the file; deleting it restores upstream behaviour.
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -96,4 +96,28 @@ export function updateRegistryUrl(): string | null {
 /** True when this install is pointed at something other than upstream. */
 export function isForkInstall(): boolean {
   return updateRepo() !== UPSTREAM_REPO;
+}
+
+/**
+ * The file inside an install that records the commit it was built from. A fork keeps upstream's
+ * version number, so the version cannot say whether an install is current — the commit can.
+ */
+export const FORK_COMMIT_MARKER = ".context-mode-fork-commit";
+
+/** The commit an install was built from, or "" when it is unknown. */
+export function readCommitMarker(path: string): string {
+  try {
+    return readFileSync(path, "utf-8").trim();
+  } catch {
+    return "";
+  }
+}
+
+/** Record the commit an install was built from, so the next upgrade can tell whether it is current. */
+export function writeCommitMarker(path: string, sha: string): void {
+  try {
+    writeFileSync(path, `${sha}\n`);
+  } catch {
+    // Best effort — the marker only saves a redundant upgrade.
+  }
 }

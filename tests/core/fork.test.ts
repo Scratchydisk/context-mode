@@ -2,7 +2,7 @@
 // Fork-only behaviour: the upgrade source and the version check are resolved at runtime, so a fork
 // install upgrades the fork instead of replacing itself with upstream's files.
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,6 +14,9 @@ import {
   updatePackage,
   updateRegistryUrl,
   isForkInstall,
+  FORK_COMMIT_MARKER,
+  readCommitMarker,
+  writeCommitMarker,
 } from "../../src/fork.js";
 
 const REPO_ENV = "CONTEXT_MODE_UPDATE_REPO";
@@ -93,5 +96,43 @@ describe("fork update source", () => {
       JSON.stringify({ repo: "Scratchydisk/context-mode", package: "" }),
     );
     expect(updateRepoUrl()).not.toContain("mksglu/context-mode");
+  });
+});
+
+describe("fork commit marker", () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "cm-fork-marker-"));
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("round-trips a commit sha", () => {
+    const path = join(home, FORK_COMMIT_MARKER);
+    expect(readCommitMarker(path)).toBe("");
+    writeCommitMarker(path, "abc123def456");
+    expect(readCommitMarker(path)).toBe("abc123def456");
+  });
+
+  it("reads an empty string when the marker is missing or unreadable", () => {
+    expect(readCommitMarker(join(home, "nope"))).toBe("");
+  });
+});
+
+describe("fork-aware upgrade short-circuit", () => {
+  // The fork and upstream share a version number forever, so a version comparison would always say
+  // "already on latest" and skip the file copy — leaving the install running upstream's code.
+  it("cli.ts compares commits rather than versions for a fork install", () => {
+    const src = readFileSync(
+      new URL("../../src/cli.ts", import.meta.url).pathname,
+      "utf-8",
+    );
+    expect(src).toContain("isForkInstall()");
+    expect(src).toContain("readCommitMarker");
+    expect(src).toContain("writeCommitMarker");
+    expect(src).toContain("localSha === cloneSha");
   });
 });

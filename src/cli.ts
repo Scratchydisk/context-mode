@@ -69,7 +69,7 @@ function browserOpenArgv(
 // ── Adapter imports ──────────────────────────────────────
 import { detectPlatform, getAdapter } from "./adapters/detect.js";
 import { isInProcessPluginPlatform } from "./adapters/types.js";
-import { updateRepo, updateRepoUrl, updateRegistryUrl } from "./fork.js";
+import { updateRepo, updateRepoUrl, updateRegistryUrl, isForkInstall, FORK_COMMIT_MARKER, readCommitMarker, writeCommitMarker } from "./fork.js";
 
 /* -------------------------------------------------------
  * Hook dispatcher — `context-mode hook <platform> <event>`
@@ -1346,13 +1346,37 @@ async function upgrade(opts?: { platform?: string }) {
       readFileSync(resolve(srcDir, "package.json"), "utf-8"),
     );
     const newVersion = newPkg.version ?? "unknown";
-    
-    if (newVersion === localVersion) {
-      p.log.success(color.green("Already on latest") + ` — v${localVersion}`);
+
+    // A fork keeps upstream's version number, so the version alone cannot say whether the local
+    // install is current: the fork and upstream are both 1.0.169 forever, and "already on latest"
+    // would skip the file copy, leaving the install running upstream's code. Compare the commit the
+    // install was built from instead.
+    const fork = isForkInstall();
+    const cloneSha = fork
+      ? (() => {
+          try {
+            return execFileSync("git", ["rev-parse", "HEAD"], {
+              cwd: srcDir,
+              stdio: "pipe",
+              timeout: 10000,
+            }).toString().trim();
+          } catch {
+            return "";
+          }
+        })()
+      : "";
+    const markerPath = resolve(pluginRoot, FORK_COMMIT_MARKER);
+    const localSha = fork ? readCommitMarker(markerPath) : "";
+    const alreadyCurrent = fork ? localSha !== "" && localSha === cloneSha : newVersion === localVersion;
+
+    if (alreadyCurrent) {
+      p.log.success(color.green("Already on latest") + (fork ? ` — ${cloneSha.slice(0, 7)}` : ` — v${localVersion}`));
       rmSync(tmpDir, { recursive: true, force: true });
     } else {
       p.log.info(
-        `Update available: ${color.yellow("v" + localVersion)} → ${color.green("v" + newVersion)}`,
+        fork
+          ? `Update available: ${color.yellow(localSha.slice(0, 7) || "unknown")} → ${color.green(cloneSha.slice(0, 7))}`
+          : `Update available: ${color.yellow("v" + localVersion)} → ${color.green("v" + newVersion)}`,
       );
 
       // v1.0.128 — Issue #559: terminate sibling MCP servers BEFORE installing
@@ -1861,6 +1885,12 @@ async function upgrade(opts?: { platform?: string }) {
           }
         }
       } catch { /* best effort — registry may not exist or be malformed */ }
+
+      // Record the commit this install was built from, so the next upgrade can tell whether it is
+      // current without relying on a version number the fork shares with upstream.
+      if (fork && cloneSha !== "") {
+        writeCommitMarker(markerPath, cloneSha);
+      }
 
       changes.push(`Updated v${localVersion} → v${newVersion}`);
       p.log.success(
