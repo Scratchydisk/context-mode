@@ -343,6 +343,21 @@ export function openInBrowser(
 function defaultPluginRoot(): string {
   const __filename = fileURLToPath(import.meta.url);
   const __dirname = dirname(__filename);
+  // The package root is the nearest ancestor that holds this package's own package.json. Resolving
+  // it that way beats inferring it from the directory name: "build/cli.js" and "src/cli.ts" sit one
+  // level below the root, but "cli.bundle.mjs" sits AT the root — and a root that happens to be named
+  // "src" or "build" breaks the name-based guess. The name-based fallback stays for a tree with no
+  // package.json above the module.
+  let dir = __dirname;
+  for (let i = 0; i < 5; i++) {
+    try {
+      const pkg = JSON.parse(readFileSync(resolve(dir, "package.json"), "utf-8")) as { name?: string };
+      if (pkg.name === "context-mode") return dir;
+    } catch { /* keep walking */ }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
   // build/cli.js or src/cli.ts → go up one level; cli.bundle.mjs at project root → stay here
   if (__dirname.endsWith("/build") || __dirname.endsWith("\\build") ||
       __dirname.endsWith("/src") || __dirname.endsWith("\\src")) {
