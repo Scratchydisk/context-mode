@@ -20,6 +20,12 @@ if (process.env.CONTEXT_MODE_SKIP_BUILD === "1") {
   process.exit(0);
 }
 
+// A dry-run pack must not mutate the tree: npm lists the tarball contents while `prepare` runs, so
+// a build writing files underneath it makes the listing non-deterministic.
+if (process.env.npm_config_dry_run === "true" || process.env.npm_config_dry_run === "1") {
+  process.exit(0);
+}
+
 // The build toolchain is a devDependency. A production install (`npm install --production`, which
 // is what the in-place upgrade runs) has no devDependencies, so there is nothing to build with.
 // The package is already built in that case — the copy carried build/ over — so skip rather than
