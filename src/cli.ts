@@ -69,6 +69,7 @@ function browserOpenArgv(
 // ── Adapter imports ──────────────────────────────────────
 import { detectPlatform, getAdapter } from "./adapters/detect.js";
 import { isInProcessPluginPlatform } from "./adapters/types.js";
+import { updateRepo, updateRepoUrl, updateRegistryUrl } from "./fork.js";
 
 /* -------------------------------------------------------
  * Hook dispatcher — `context-mode hook <platform> <event>`
@@ -382,12 +383,17 @@ function getLocalVersion(): string {
 }
 
 async function fetchLatestVersion(): Promise<string> {
+  // A fork install can point the check at its own package, or disable it entirely when it is not
+  // published to npm — comparing a fork build against an unrelated package's release would report a
+  // permanent, meaningless "outdated".
+  const url = updateRegistryUrl();
+  if (url === null) return "unknown";
   // Use node:https instead of global fetch to avoid a Windows libuv assertion
   // (UV_HANDLE_CLOSING) caused by undici's connection-pool background threads
   // racing with process.exit() teardown on Node.js v24+.
   return new Promise((resolve) => {
     const req = httpsRequest(
-      "https://registry.npmjs.org/context-mode/latest",
+      url,
       { headers: { Connection: "close" } },
       (res) => {
         let raw = "";
@@ -1302,10 +1308,12 @@ async function upgrade(opts?: { platform?: string }) {
   const localVersion = getLocalVersion();
   const tmpDir = join(tmpdir(), `context-mode-upgrade-${Date.now()}`);
 
-  s.start("Cloning mksglu/context-mode");
+  // A fork install clones the fork, not upstream: cloning upstream here would copy upstream's
+  // files over this install and silently drop every fix the fork carries.
+  s.start(`Cloning ${updateRepo()}`);
   try {
     execFileSync(
-      "git", ["clone", "--depth", "1", "https://github.com/mksglu/context-mode.git", tmpDir],
+      "git", ["clone", "--depth", "1", updateRepoUrl(), tmpDir],
       { stdio: "pipe", timeout: 30000 },
     );
     s.stop("Downloaded");
@@ -1889,7 +1897,7 @@ async function upgrade(opts?: { platform?: string }) {
   // Step 4: Configure hooks — adapter-aware
   p.log.step(`Configuring ${adapter.name} hooks...`);
   try {
-    const hookChanges = adapter.configureAllHooks(pluginRoot);
+    const hookChanges = adapter.configureAllHooks(pluginRoot, defaultPluginRoot());
     for (const change of hookChanges) {
       p.log.info(color.dim(`  ${change}`));
       changes.push(change);

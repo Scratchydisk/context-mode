@@ -307,8 +307,14 @@ export interface HookAdapter {
 
   // ── Upgrade ────────────────────────────────────────────
 
-  /** Configure all hooks for this platform. Returns change descriptions. */
-  configureAllHooks(pluginRoot: string): string[];
+  /**
+   * Configure all hooks for this platform. Returns change descriptions.
+   *
+   * `pluginRoot` is the platform's own plugin location. `installRoot` is the directory this
+   * context-mode install actually lives in — the two differ for in-process plugin platforms, whose
+   * `pluginRoot` points at a host-managed npm cache rather than at the running install.
+   */
+  configureAllHooks(pluginRoot: string, installRoot?: string): string[];
 
   /** Backup platform settings before modification. Returns backup path or null. */
   backupSettings(): string | null;

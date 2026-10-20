@@ -14,6 +14,9 @@ function env(home: string) {
     USERPROFILE: home,
     HOMEDRIVE: root.replace(/[\\/]+$/, ""),
     HOMEPATH: home.slice(root.length) || root,
+    // Pin the OpenCode generation so the config-key behaviour does not depend on which OpenCode
+    // happens to be installed on the machine running the suite.
+    CONTEXT_MODE_OPENCODE_MAJOR: "1",
   };
 }
 
@@ -597,6 +600,114 @@ describe("OpenCodeAdapter", () => {
         expect(jsonSibling).toEqual({
           plugin: ["alpha", "beta", "context-mode"],
         });
+
+        rmSync(root, { recursive: true, force: true });
+      });
+
+      // ── OpenCode 2: the `plugins` key ───────────────────
+      //
+      // OpenCode 2 renamed the plugin config key from `plugin` to `plugins`, and its config normaliser
+      // merges the legacy key into the same list. Writing both would register context-mode twice, and
+      // a bare `"context-mode"` spec makes OpenCode npm-install the upstream package from the registry
+      // rather than loading this install.
+
+      it("OpenCode 2 writes the 'plugins' key, not the legacy 'plugin' key", () => {
+        const root = mkdtempSync(join(tmpdir(), "opencode-adapter-"));
+        const dir = join(root, "project");
+        const home = join(root, "home");
+        const conf = join(home, ".config", "opencode");
+        const file = join(conf, "opencode.json");
+        const src = resolve(process.cwd(), "src", "adapters", "opencode", "index.ts");
+        const tsx = resolve(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+        mkdirSync(dir, { recursive: true });
+        mkdirSync(conf, { recursive: true });
+        writeFileSync(file, JSON.stringify({ plugin: ["legacy-other"] }, null, 2) + "\n");
+        const run = spawnSync(
+          process.execPath,
+          [
+            tsx,
+            "-e",
+            `import { OpenCodeAdapter } from ${JSON.stringify(src)};const a=new OpenCodeAdapter();console.log(JSON.stringify(a.configureAllHooks('/tmp/install-root','/tmp/install-root')))`,
+          ],
+          {
+            cwd: dir,
+            env: { ...env(home), CONTEXT_MODE_OPENCODE_MAJOR: "2" },
+            encoding: "utf-8",
+          },
+        );
+
+        expect(run.status).toBe(0);
+        const written = JSON.parse(readFileSync(file, "utf-8"));
+        expect(written.plugins).toEqual(["/tmp/install-root"]);
+        // The legacy key must not keep a context-mode entry: OpenCode merges it into `plugins`.
+        expect(written.plugin ?? []).not.toContain("context-mode");
+        expect(written.plugin ?? []).toContain("legacy-other");
+
+        rmSync(root, { recursive: true, force: true });
+      });
+
+      it("OpenCode 2 never writes a bare 'context-mode' npm spec", () => {
+        const root = mkdtempSync(join(tmpdir(), "opencode-adapter-"));
+        const dir = join(root, "project");
+        const home = join(root, "home");
+        const conf = join(home, ".config", "opencode");
+        const file = join(conf, "opencode.json");
+        const src = resolve(process.cwd(), "src", "adapters", "opencode", "index.ts");
+        const tsx = resolve(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+        mkdirSync(dir, { recursive: true });
+        mkdirSync(conf, { recursive: true });
+        writeFileSync(file, JSON.stringify({}, null, 2) + "\n");
+        const run = spawnSync(
+          process.execPath,
+          [
+            tsx,
+            "-e",
+            `import { OpenCodeAdapter } from ${JSON.stringify(src)};const a=new OpenCodeAdapter();console.log(JSON.stringify(a.configureAllHooks('/tmp/install-root','/tmp/install-root')))`,
+          ],
+          {
+            cwd: dir,
+            env: { ...env(home), CONTEXT_MODE_OPENCODE_MAJOR: "2" },
+            encoding: "utf-8",
+          },
+        );
+
+        expect(run.status).toBe(0);
+        const written = JSON.parse(readFileSync(file, "utf-8"));
+        expect(written.plugins).toEqual(["/tmp/install-root"]);
+        expect(written.plugins).not.toContain("context-mode");
+
+        rmSync(root, { recursive: true, force: true });
+      });
+
+      it("OpenCode 1 still writes the legacy 'plugin' key", () => {
+        const root = mkdtempSync(join(tmpdir(), "opencode-adapter-"));
+        const dir = join(root, "project");
+        const home = join(root, "home");
+        const conf = join(home, ".config", "opencode");
+        const file = join(conf, "opencode.json");
+        const src = resolve(process.cwd(), "src", "adapters", "opencode", "index.ts");
+        const tsx = resolve(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+        mkdirSync(dir, { recursive: true });
+        mkdirSync(conf, { recursive: true });
+        writeFileSync(file, JSON.stringify({}, null, 2) + "\n");
+        const run = spawnSync(
+          process.execPath,
+          [
+            tsx,
+            "-e",
+            `import { OpenCodeAdapter } from ${JSON.stringify(src)};const a=new OpenCodeAdapter();console.log(JSON.stringify(a.configureAllHooks('/tmp/install-root','/tmp/install-root')))`,
+          ],
+          {
+            cwd: dir,
+            env: { ...env(home), CONTEXT_MODE_OPENCODE_MAJOR: "1" },
+            encoding: "utf-8",
+          },
+        );
+
+        expect(run.status).toBe(0);
+        const written = JSON.parse(readFileSync(file, "utf-8"));
+        expect(written.plugin).toEqual(["context-mode"]);
+        expect(written.plugins).toBeUndefined();
 
         rmSync(root, { recursive: true, force: true });
       });

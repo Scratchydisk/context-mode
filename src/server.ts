@@ -30,6 +30,7 @@ import {
   hasBunRuntime,
 } from "./runtime.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
+import { updateRegistryUrl, updateRepoUrl } from "./fork.js";
 import { startLifecycleGuard, noteMcpActivity, noteRequestStart, noteRequestEnd, attachMcpActivityTap } from "./lifecycle.js";
 import { charSafePrefix } from "./truncate.js";
 import {
@@ -778,9 +779,14 @@ const VERSION_BURST_SIZE = 3;
 const VERSION_SILENT_MS = 60 * 60 * 1000; // 1 hour
 
 async function fetchLatestVersion(): Promise<string> {
+  // A fork install can point the check at its own package, or disable it entirely when it is not
+  // published to npm — comparing a fork build against an unrelated package's release would report a
+  // permanent, meaningless "outdated".
+  const url = updateRegistryUrl();
+  if (url === null) return "unknown";
   return new Promise((res) => {
     const req = httpsRequest(
-      "https://registry.npmjs.org/context-mode/latest",
+      url,
       { headers: { Connection: "close" } },
       (resp) => {
         let raw = "";
@@ -4343,7 +4349,9 @@ server.registerTool(
     } else {
       // Inline fallback: neither CLI file exists (e.g. marketplace installs).
       // Generate a self-contained node -e script that performs the upgrade.
-      const repoUrl = "https://github.com/mksglu/context-mode.git";
+      // A fork install clones the fork: cloning upstream here would copy upstream's files over this
+      // install and silently drop every fix the fork carries.
+      const repoUrl = updateRepoUrl();
       // Write inline script to a temp .mjs file — avoids quote-escaping issues
       // across cmd.exe, PowerShell, and bash (node -e '...' breaks on Windows).
       const scriptLines = [

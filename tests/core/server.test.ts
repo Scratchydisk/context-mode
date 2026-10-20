@@ -2895,10 +2895,18 @@ describe("Version outdated warning in trackResponse", () => {
     resolve(__dirname, "../../src/server.ts"),
     "utf-8",
   );
+  // The registry URL moved to src/fork.ts so a fork install can point the check at its own package
+  // (or disable it) instead of comparing this build against upstream's release.
+  const forkSrc = readFileSync(
+    resolve(__dirname, "../../src/fork.ts"),
+    "utf-8",
+  );
 
   test("fetchLatestVersion function exists and uses npm registry", () => {
     expect(serverSrc).toContain("function fetchLatestVersion");
-    expect(serverSrc).toContain("registry.npmjs.org/context-mode");
+    expect(serverSrc).toContain("updateRegistryUrl");
+    expect(forkSrc).toContain("registry.npmjs.org/");
+    expect(forkSrc).toContain("UPSTREAM_PACKAGE = \"context-mode\"");
   });
 
   test("version check fires in main() after server.connect", () => {

@@ -2922,7 +2922,7 @@ describe("Shell-free upgrade (#185)", () => {
     const upgradeBody = CLI_SOURCE.slice(upgradeStart);
 
     expect(upgradeBody).toContain("Hook configuration failed");
-    expect(upgradeBody).toMatch(/try\s*\{\s*const hookChanges = adapter\.configureAllHooks\(pluginRoot\)/s);
+    expect(upgradeBody).toMatch(/try\s*\{\s*const hookChanges = adapter\.configureAllHooks\(pluginRoot[,\)]/s);
     expect(upgradeBody).toMatch(/\}\s*catch\s*\(err: unknown\)\s*\{[\s\S]*throw new Error\(`Hook configuration failed: \$\{message\}`\);/s);
   });
 
@@ -2947,7 +2947,7 @@ describe("Shell-free upgrade (#185)", () => {
 
     const alreadyLatestIdx = upgradeBody.indexOf('p.log.success(color.green("Already on latest")');
     expect(alreadyLatestIdx).toBeGreaterThan(-1);
-    const configureIdx = upgradeBody.indexOf("adapter.configureAllHooks(pluginRoot)");
+    const configureIdx = upgradeBody.indexOf("adapter.configureAllHooks(pluginRoot");
     expect(configureIdx).toBeGreaterThan(-1);
     expect(configureIdx).toBeGreaterThan(alreadyLatestIdx);
   });

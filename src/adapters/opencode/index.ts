@@ -27,6 +27,7 @@ import {
 } from "node:fs";
 import { resolve, join, dirname, extname, basename } from "node:path";
 import { homedir } from "node:os";
+import { execFileSync } from "node:child_process";
 
 import { BaseAdapter, resolveContextModeDataRoot } from "../base.js";
 import { stripJsonComments } from "../../util/jsonc.js";
@@ -83,6 +84,37 @@ import { HOOK_TYPES as OPENCODE_HOOK_NAMES } from "./hooks.js";
 // ─────────────────────────────────────────────────────────
 
 export type AdapterPlatformType = Extract<PlatformId, "opencode" | "kilo">;
+
+/**
+ * The OpenCode major version this install is talking to, or `null` when it cannot be determined.
+ *
+ * OpenCode 2 renamed the plugin config key from `plugin` to `plugins` and its config normaliser merges
+ * the legacy key into the same list, so the two cannot both be written. The version decides which key
+ * this adapter uses. `null` means "unknown" — the V1 key is the safe default, because a V1 host
+ * ignores an unknown `plugins` key while a V2 host would still read a legacy `plugin` entry.
+ *
+ * `CONTEXT_MODE_OPENCODE_MAJOR` overrides the probe, so a test — or a host that is not on PATH — can
+ * pin the generation without depending on which OpenCode happens to be installed.
+ */
+function detectOpencodeMajor(): number | null {
+  const override = process.env.CONTEXT_MODE_OPENCODE_MAJOR?.trim();
+  if (override) {
+    const parsed = Number(override);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  try {
+    const out = execFileSync("opencode", ["--version"], {
+      encoding: "utf8",
+      timeout: 5000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const match = /(\d+)\.(\d+)/.exec(out);
+    return match ? Number(match[1]) : null;
+  } catch {
+    // opencode is not on PATH, or it failed — treat as unknown.
+    return null;
+  }
+}
 
 export class OpenCodeAdapter extends BaseAdapter implements HookAdapter {
   get name(): string {
@@ -495,14 +527,22 @@ export class OpenCodeAdapter extends BaseAdapter implements HookAdapter {
 
   // ── Upgrade ────────────────────────────────────────────
 
-  configureAllHooks(_pluginRoot: string): string[] {
+  configureAllHooks(pluginRoot: string, installRoot?: string): string[] {
     const settings = this.readSettings() ?? {};
     const changes: string[] = [];
 
     const siblingPaths = this.findSiblingConfigPaths();
     const siblingPlugins = this.readSiblingPlugins(siblingPaths);
 
-    const plugins = (settings.plugin ?? []) as string[];
+    // OpenCode 2 renamed the plugin config key from `plugin` to `plugins`, and its config normaliser
+    // merges the legacy `plugin` key into the same list (opencode core/src/config/normalize.ts:185-190).
+    // Writing the V1 key on a V2 host would make OpenCode npm-install the `context-mode` package — which
+    // is upstream's build, not this install's — so the key is chosen from the host's major version.
+    const major = detectOpencodeMajor();
+    const isV2 = major !== null && major >= 2;
+    const key = isV2 ? "plugins" : "plugin";
+
+    const plugins = (settings[key] ?? []) as string[];
 
     for (const sp of siblingPlugins) {
       if (!plugins.includes(sp)) {
@@ -511,13 +551,33 @@ export class OpenCodeAdapter extends BaseAdapter implements HookAdapter {
     }
 
     if (!plugins.some((p) => p.includes("context-mode"))) {
-      plugins.push("context-mode");
-      changes.push("Added context-mode to plugin array");
+      // On V2 a bare `"context-mode"` spec is an npm package name: OpenCode would resolve it from the
+      // registry and load upstream's build. Point at this install's own directory instead — a plugin
+      // directory is a supported spec (opencode.ai/v2/docs/build/plugins — "or plugin directories").
+      // `installRoot` is where this context-mode actually lives; `pluginRoot` is the host's npm
+      // cache, which holds whatever package OpenCode installed for itself.
+      const target = isV2 ? (installRoot ?? pluginRoot) : "context-mode";
+      plugins.push(target);
+      changes.push(`Added context-mode to ${key} array${isV2 ? ` (${target})` : ""}`);
     } else {
-      changes.push("context-mode already in plugin array");
+      changes.push(`context-mode already in ${key} array`);
     }
 
-    settings.plugin = plugins;
+    settings[key] = plugins;
+
+    if (isV2) {
+      // The legacy key must not linger on a V2 host: OpenCode merges it into `plugins`, so a leftover
+      // `"context-mode"` there would register the npm package next to this install.
+      const legacy = settings.plugin;
+      if (Array.isArray(legacy)) {
+        const kept = legacy.filter((p) => typeof p !== "string" || !p.includes("context-mode"));
+        if (kept.length !== legacy.length) {
+          if (kept.length === 0) delete settings.plugin;
+          else settings.plugin = kept;
+          changes.push("Removed context-mode from the legacy plugin array");
+        }
+      }
+    }
 
     const mcp = settings.mcp;
     if (mcp && typeof mcp === "object" && !Array.isArray(mcp)) {
@@ -547,8 +607,12 @@ export class OpenCodeAdapter extends BaseAdapter implements HookAdapter {
         const raw = readFileSync(configPath, "utf-8");
         const text = configPath.endsWith(".jsonc") ? stripJsonComments(raw) : raw;
         const settings = JSON.parse(text) as Record<string, unknown>;
-        if (Array.isArray(settings.plugin)) {
-          for (const p of settings.plugin) {
+        // Both keys: a sibling config may register the plugin under the V2 `plugins` key or the
+        // legacy `plugin` key, and OpenCode merges them into one list.
+        for (const key of ["plugin", "plugins"]) {
+          const list = settings[key];
+          if (!Array.isArray(list)) continue;
+          for (const p of list) {
             if (typeof p === "string" && !plugins.includes(p)) {
               plugins.push(p);
             }
@@ -593,8 +657,15 @@ export class OpenCodeAdapter extends BaseAdapter implements HookAdapter {
    * Check whether a settings object has the context-mode plugin registered.
    */
   private hasContextModePlugin(settings: Record<string, unknown>): boolean {
-    const plugins = settings.plugin;
-    return Array.isArray(plugins) && plugins.some((p: unknown) => typeof p === "string" && p.includes("context-mode"));
+    // Both keys are checked: OpenCode 2 reads `plugins` and merges the legacy `plugin` key into the
+    // same list, so an entry under either key means the plugin is registered.
+    for (const key of ["plugin", "plugins"]) {
+      const plugins = settings[key];
+      if (Array.isArray(plugins) && plugins.some((p: unknown) => typeof p === "string" && p.includes("context-mode"))) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private hasLegacyContextModeMcp(settings: Record<string, unknown>): boolean {

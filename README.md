@@ -82,6 +82,50 @@ Context Mode is an MCP server that solves all four sides of this problem:
 </a>
 <p align="center"><a href="https://www.youtube.com/watch?v=QUHrntlfPo4"><img src="https://img.shields.io/badge/%E2%96%B6%EF%B8%8F_Watch_Demo-YouTube-FF0000?style=for-the-badge&logo=youtube&logoColor=white" alt="Watch on YouTube"></a></p>
 
+## Running the fork
+
+The install below is for **upstream**. To run this fork instead — and keep running it until upstream
+ships the equivalent — use the fork installer. It does three things the upstream install cannot:
+
+1. Installs the fork's code rather than npm's `context-mode` package.
+2. Points `/ctx-upgrade` at the fork. Upstream's upgrade clones **upstream** and copies its files over
+   the install, which would silently drop every fix this fork carries.
+3. Points OpenCode 2 at this build. A bare `"context-mode"` entry in OpenCode's `plugins` array is an
+   npm package name — OpenCode would install upstream's build from the registry and load that instead.
+
+```bash
+# From a checkout of this repo:
+scripts/install-fork.sh --dir "$PWD"
+
+# Or from the fork on GitHub (once this branch is pushed):
+scripts/install-fork.sh
+```
+
+Then, once per machine:
+
+```bash
+context-mode upgrade      # wires the hooks and the OpenCode 2 config
+context-mode doctor       # verify
+```
+
+The installer writes `~/.context-mode/fork.json`:
+
+```json
+{ "repo": "Scratchydisk/context-mode", "package": "" }
+```
+
+`repo` is where `/ctx-upgrade` clones from. An empty `package` disables the "a new version is
+available" check, because this build is not published to npm — without that, every session would
+report the fork as outdated relative to upstream's release. Delete the file to go back to upstream
+behaviour.
+
+Two things to know:
+
+- `npm update -g context-mode` still pulls **upstream** — the package name is the same and npm
+  resolves it from the registry. Use `context-mode upgrade` instead.
+- `npm ls -g context-mode` shows the fork's version, which matches upstream's version number. The
+  fork's own changes are visible in `context-mode doctor` and in the OpenCode 2 support.
+
 ## Install
 
 Platforms are grouped by install complexity. Hook-capable platforms get automatic routing enforcement. Non-hook platforms need a one-time routing file copy.
