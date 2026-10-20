@@ -1,8 +1,9 @@
 import "../setup-home";
 import { describe, it, expect, beforeEach } from "vitest";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join, parse, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 import { OpenCodeAdapter } from "../../src/adapters/opencode/index.js";
 
@@ -679,8 +680,7 @@ describe("OpenCodeAdapter", () => {
         rmSync(root, { recursive: true, force: true });
       });
 
-      it("OpenCode 1 still writes the legacy 'plugin' key", () => {
-        const root = mkdtempSync(join(tmpdir(), "opencode-adapter-"));
+      it("OpenCode 1 still writes the legacy 'plugin' key", () => {        const root = mkdtempSync(join(tmpdir(), "opencode-adapter-"));
         const dir = join(root, "project");
         const home = join(root, "home");
         const conf = join(home, ".config", "opencode");
@@ -935,6 +935,41 @@ describe("OpenCodeAdapter for KiloCode", () => {
       // Should NOT substitute jsRuntime since claude-code is not an in-process platform
       expect(cmd).not.toContain("/usr/bin/bun");
       expect(cmd).toContain("/script.mjs");
+    });
+  });
+
+  // ── OpenCode 2 plugin entrypoint ────────────────────────
+  //
+  // OpenCode 2 resolves a local plugin *directory* by looking for an `index` or `server` entry inside
+  // it (packages/plugin/src/host.ts — Host.resolve). It never reads the package's `main` or `exports`,
+  // and a directory with neither entry is dropped in silence
+  // (packages/core/src/config/plugin/source.ts — `if (!entrypoints.server) return []`).
+  //
+  // Without index.js, `plugins: ["<install dir>"]` resolves to nothing and the fork never loads.
+
+  describe("OpenCode 2 plugin entrypoint", () => {
+    const root = resolve(__dirname, "../..");
+
+    it("the package root has an index.js entry", () => {
+      expect(existsSync(join(root, "index.js"))).toBe(true);
+    });
+
+    it("index.js re-exports the built plugin", () => {
+      const source = readFileSync(join(root, "index.js"), "utf-8");
+      expect(source).toContain("./build/adapters/opencode/plugin.js");
+    });
+
+    it("index.js is published with the package", () => {
+      const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf-8")) as { files?: string[] };
+      expect(pkg.files ?? []).toContain("index.js");
+    });
+
+    it("the built plugin's default export carries a V2 setup function", async () => {
+      const built = join(root, "build", "adapters", "opencode", "plugin.js");
+      if (!existsSync(built)) return; // not built in this checkout — the build test covers it
+      const mod = (await import(pathToFileURL(built).href)) as { default?: { id?: unknown; setup?: unknown } };
+      expect(typeof mod.default?.id).toBe("string");
+      expect(typeof mod.default?.setup).toBe("function");
     });
   });
 });
