@@ -130,8 +130,62 @@ describe("fork commit marker", () => {
   });
 });
 
-describe("fork-aware upgrade short-circuit", () => {
-  // The fork and upstream share a version number forever, so a version comparison would always say
+describe("marketplace source repointing", () => {
+  // Claude Code's marketplace registry records the repository it re-clones from. Left at upstream,
+  // the next marketplace refresh replaces the fork's files and reinstalls the plugin from upstream.
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "cm-fork-mp-"));
+    mkdirSync(join(home, ".claude", "plugins"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("repoints the context-mode marketplace record at the fork", async () => {
+    const { repointMarketplaceSource } = await import("../../src/cli.js");
+    const marketplaceDir = join(home, ".claude", "plugins", "marketplaces", "context-mode");
+    const registry = join(home, ".claude", "plugins", "known_marketplaces.json");
+    writeFileSync(
+      registry,
+      JSON.stringify({
+        "context-mode": {
+          source: { source: "github", repo: "mksglu/context-mode" },
+          installLocation: marketplaceDir,
+        },
+      }),
+    );
+
+    const prevHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      expect(repointMarketplaceSource(marketplaceDir, "Scratchydisk/context-mode")).toBe(true);
+      const updated = JSON.parse(readFileSync(registry, "utf-8")) as Record<string, { source: { repo: string } }>;
+      expect(updated["context-mode"].source.repo).toBe("Scratchydisk/context-mode");
+      // A second run has nothing to change.
+      expect(repointMarketplaceSource(marketplaceDir, "Scratchydisk/context-mode")).toBe(false);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+    }
+  });
+
+  it("leaves a missing registry alone", async () => {
+    const { repointMarketplaceSource } = await import("../../src/cli.js");
+    const prevHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      expect(repointMarketplaceSource(join(home, "nope"), "Scratchydisk/context-mode")).toBe(false);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+    }
+  });
+});
+
+describe("fork-aware upgrade short-circuit", () => {  // The fork and upstream share a version number forever, so a version comparison would always say
   // "already on latest" and skip the file copy — leaving the install running upstream's code.
   it("cli.ts compares commits rather than versions for a fork install", () => {
     const src = readFileSync(

@@ -388,6 +388,41 @@ function getPluginRoot(): string {
   return defaultPluginRoot();
 }
 
+/**
+ * Point the Claude Code marketplace registry at a different repository.
+ *
+ * `~/.claude/plugins/known_marketplaces.json` records the source each marketplace is cloned from.
+ * A marketplace whose record still names upstream is re-cloned from upstream on the next refresh,
+ * which replaces the fork's files and reinstalls the plugin from upstream's build.
+ *
+ * Returns true when the record was changed.
+ */
+export function repointMarketplaceSource(marketplaceDir: string, repo: string): boolean {
+  const registryPath = resolve(resolveClaudeConfigDir(), "plugins", "known_marketplaces.json");
+  try {
+    const raw = JSON.parse(readFileSync(registryPath, "utf-8")) as Record<string, unknown>;
+    let changed = false;
+    for (const [key, entry] of Object.entries(raw)) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const record = entry as { source?: { source?: string; repo?: string }; installLocation?: string };
+      // Match by install location first, then by name — the record for this marketplace is the one
+      // pointing at the clone directory.
+      const isOurs = record.installLocation === marketplaceDir || key === "context-mode";
+      if (!isOurs) continue;
+      if (record.source?.source !== "github") continue;
+      if (record.source.repo === repo) continue;
+      record.source.repo = repo;
+      changed = true;
+    }
+    if (!changed) return false;
+    writeFileSync(registryPath, `${JSON.stringify(raw, null, 2)}\n`);
+    return true;
+  } catch {
+    // No registry, or it is not the shape we expect — leave it alone.
+    return false;
+  }
+}
+
 function getLocalVersion(): string {
   try {
     const pkg = JSON.parse(readFileSync(resolve(getPluginRoot(), "package.json"), "utf-8"));
@@ -1316,13 +1351,24 @@ async function upgrade(opts?: { platform?: string }) {
           { stdio: "pipe", timeout: 10000 },
         );
         s.stop(color.green("Marketplace clone synced"));
-        changes.push("Marketplace clone updated to upstream");
+        changes.push(`Marketplace clone updated to ${isForkInstall() ? updateRepo() : "upstream"}`);
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       s.stop(color.yellow("Marketplace sync skipped"));
       p.log.warn(color.yellow("git refresh on marketplace failed") + ` — ${message}`);
       p.log.info(color.dim("  Continuing — cache dir update will still happen."));
+    }
+  }
+
+  // The marketplace registry records the repository Claude Code re-clones from when it refreshes
+  // the marketplace. Left pointing at upstream, the next refresh replaces the clone with upstream's
+  // code and reinstalls the plugin from it — undoing the fork install without any error. Point the
+  // record at the fork.
+  if (isForkInstall()) {
+    const repointed = repointMarketplaceSource(marketplaceDir, updateRepo());
+    if (repointed) {
+      changes.push(`Marketplace source repointed to ${updateRepo()}`);
     }
   }
 
