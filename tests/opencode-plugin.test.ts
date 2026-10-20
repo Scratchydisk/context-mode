@@ -80,8 +80,11 @@ describe("ContextModePlugin", () => {
 
     it("default export also carries a V2 setup() when @opencode/plugin is installed", async () => {
       // Confirms the dual-export carries `setup` (built inline, no dependency
-      // on `@opencode/plugin` resolving).
-      await import("@opencode/plugin");
+      // on `@opencode/plugin` resolving). The package is not a dependency of
+      // this one — it is never imported at runtime, and the newest release
+      // depends on a version of @opencode/protocol that was never published,
+      // so requiring it here would make every install depend on a broken
+      // beta package for nothing.
       const mod = await import("../src/adapters/opencode/plugin.js");
       expect(typeof (mod.default as any).setup).toBe("function");
     });
