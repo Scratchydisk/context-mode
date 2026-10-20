@@ -24,6 +24,12 @@ interface ForkConfig {
   /** GitHub slug (owner/repo) the upgrade clones. */
   repo?: string;
   /**
+   * The clone URL, when it differs from the default HTTPS form of `repo`. Set it to an SSH URL
+   * (`git@github.com:owner/repo.git`) when HTTPS cloning is unreliable — a flaky TLS handshake
+   * fails the whole upgrade.
+   */
+  url?: string;
+  /**
    * npm package the version check reads. An empty string disables the check — used when the fork is
    * not published to npm, so `ctx_doctor` stops comparing against upstream's release.
    */
@@ -69,8 +75,14 @@ export function updateRepo(): string {
   return pick(process.env[UPDATE_REPO_ENV], cfg.repo, UPSTREAM_REPO);
 }
 
-/** The clone URL for `updateRepo()`. */
+/**
+ * The clone URL for `updateRepo()`. A configured URL wins, so the fork can be cloned over SSH when
+ * HTTPS cloning is unreliable.
+ */
 export function updateRepoUrl(): string {
+  const cfg = readConfig();
+  const configured = cfg.url?.trim();
+  if (configured) return configured;
   return `https://github.com/${updateRepo()}.git`;
 }
 

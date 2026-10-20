@@ -85,6 +85,14 @@ describe("fork update source", () => {
     expect(updateRepo()).toBe("someone/else");
   });
 
+  it("uses a configured clone url when one is set", () => {
+    writeFileSync(
+      join(home, ".context-mode", "fork.json"),
+      JSON.stringify({ repo: "Scratchydisk/context-mode", url: "git@github.com:Scratchydisk/context-mode.git" }),
+    );
+    expect(updateRepoUrl()).toBe("git@github.com:Scratchydisk/context-mode.git");
+  });
+
   it("ignores a malformed or unreadable config file", () => {
     writeFileSync(join(home, ".context-mode", "fork.json"), "{ not json");
     expect(updateRepo()).toBe(UPSTREAM_REPO);

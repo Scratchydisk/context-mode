@@ -105,13 +105,25 @@ run npm install -g --no-audit --no-fund $ALLOW_SCRIPTS "$FORK_DIR"
 # Without this, /ctx-upgrade clones upstream and overwrites the install with upstream's files.
 say "Pointing the upgrade at the fork"
 run mkdir -p "$(dirname "$FORK_JSON")"
+
+# Prefer SSH when this machine has GitHub SSH access: HTTPS cloning over GnuTLS fails with a
+# flaky handshake often enough to break the upgrade, and the SSH key is already set up for the push.
+FORK_URL="https://github.com/$FORK_REPO.git"
+if git ls-remote "git@github.com:$FORK_REPO.git" HEAD >/dev/null 2>&1; then
+  FORK_URL="git@github.com:$FORK_REPO.git"
+  info "using SSH for the upgrade clone"
+else
+  info "using HTTPS for the upgrade clone"
+fi
+
 if [ "$DRY_RUN" = "1" ]; then
   info "[dry-run] would write $FORK_JSON:"
-  info '         {"repo": "'"$FORK_REPO"'"}'
+  info '         {"repo": "'"$FORK_REPO"'", "url": "'"$FORK_URL"'", "package": ""}'
 else
   cat > "$FORK_JSON" <<JSON
 {
   "repo": "$FORK_REPO",
+  "url": "$FORK_URL",
   "package": ""
 }
 JSON

@@ -25,13 +25,11 @@ const ROOT = resolve(__dirname, "..", "..");
 
 const cliSrc = readFileSync(resolve(ROOT, "src", "cli.ts"), "utf-8");
 const upgradeIdx = cliSrc.indexOf("async function upgrade");
-// Widened from 16000 → 20000 chars (#738): the bun-resolution probe added
-// ~400 chars to the post-normalizeHooksJsonOnly block, pushing
-// healPluginJsonMcpServers close enough to the original 16000 cutoff that the
-// downstream `Plugin manifest drift` throw fell outside the per-test slice.
-// Window the SOURCE generously here; per-test slices already cap their own
-// inspection windows below.
-const upgradeBody = cliSrc.slice(upgradeIdx, upgradeIdx + 20000);
+// Sliced to the end of the file rather than to a fixed character count. The count was a moving
+// target — 16000 → 20000 (#738) because the bun-resolution probe pushed the downstream
+// `Plugin manifest drift` throw outside the window, and any later addition to upgrade() would push
+// it out again. Each test below bounds its own inspection window, so the extra text is harmless.
+const upgradeBody = cliSrc.slice(upgradeIdx);
 
 describe("cli.ts upgrade() — Issue #523 plugin.json placeholder assertion", () => {
   test("post-bump block invokes healPluginJsonMcpServers from the shared module", () => {
@@ -60,7 +58,10 @@ describe("cli.ts upgrade() — Issue #523 plugin.json placeholder assertion", ()
     //   (b) assert post-heal that no further drift is detected → throw on second-pass heal
     // We pick (a)+(b) belt-and-braces: a second healPluginJsonMcpServers call MUST
     // return healed:[] or upgrade() throws "Plugin manifest drift".
-    const healCallIdx = upgradeBody.indexOf("healPluginJsonMcpServers");
+    // The contract is about the SECOND heal call (the post-heal assertion), so anchor on the last
+    // call rather than the first — a fixed character window from the first call breaks whenever
+    // unrelated code is added above it.
+    const healCallIdx = upgradeBody.lastIndexOf("healPluginJsonMcpServers");
     expect(healCallIdx).toBeGreaterThan(-1);
     const block = upgradeBody.slice(healCallIdx, healCallIdx + 1500);
     expect(block).toMatch(/Plugin manifest drift|plugin\.json.*drift|drift.*plugin\.json/i);

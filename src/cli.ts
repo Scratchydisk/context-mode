@@ -1335,10 +1335,26 @@ async function upgrade(opts?: { platform?: string }) {
   // files over this install and silently drop every fix the fork carries.
   s.start(`Cloning ${updateRepo()}`);
   try {
-    execFileSync(
-      "git", ["clone", "--depth", "1", updateRepoUrl(), tmpDir],
-      { stdio: "pipe", timeout: 30000 },
-    );
+    // A flaky TLS handshake fails the whole upgrade, and the upgrade is how a fork install stays
+    // current. Three attempts, because the failure is transient rather than real.
+    let cloned = false;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 3 && !cloned; attempt++) {
+      try {
+        execFileSync(
+          "git", ["clone", "--depth", "1", updateRepoUrl(), tmpDir],
+          { stdio: "pipe", timeout: 60000 },
+        );
+        cloned = true;
+      } catch (err: unknown) {
+        lastError = err;
+        rmSync(tmpDir, { recursive: true, force: true });
+        if (attempt < 3) {
+          p.log.info(color.dim(`  Clone attempt ${attempt} failed — retrying`));
+        }
+      }
+    }
+    if (!cloned) throw lastError;
     s.stop("Downloaded");
 
     const srcDir = tmpDir;
