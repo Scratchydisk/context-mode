@@ -78,6 +78,10 @@
     "README.md",
     "LICENSE"
   ],
+  "allowScripts": {
+    "better-sqlite3": true,
+    "esbuild": true
+  },
   "scripts": {
     "build": "tsc && node -e \"if(process.platform!=='win32'){require('fs').chmodSync('build/cli.js',0o755)}\" && npm run bundle && npm run assert-bundle && npm run assert-asymmetric-drift",
     "assert-bundle": "node scripts/assert-bundle.mjs server.bundle.mjs cli.bundle.mjs hooks/session-extract.bundle.mjs hooks/session-snapshot.bundle.mjs hooks/session-db.bundle.mjs hooks/security.bundle.mjs",

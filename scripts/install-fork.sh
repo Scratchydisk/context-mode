@@ -49,9 +49,12 @@ run()  { if [ "$DRY_RUN" = "1" ]; then info "[dry-run] $*"; else "$@"; fi; }
 command -v npm >/dev/null 2>&1 || { echo "npm is required" >&2; exit 1; }
 command -v node >/dev/null 2>&1 || { echo "node is required" >&2; exit 1; }
 
-# npm 11 gates lifecycle scripts behind an allow-list. Without this, `prepare` (the build) and
-# `postinstall` (the better-sqlite3 heal) are skipped and the install is broken. Older npm has no
-# such flag and runs everything, so the flag is only added when npm understands it.
+# npm 11 gates dependency lifecycle scripts behind an allow-list. The project's own package.json
+# carries `allowScripts` for its dependencies (better-sqlite3's native build, esbuild's binary), so
+# the project-scoped install needs no flag. A global install has no project package.json to write
+# to, so it takes the flag — without it the `prepare` hook (the build) and `postinstall` (the
+# better-sqlite3 heal) are skipped and the install is broken. Older npm has no such flag and runs
+# everything, so it is only added when npm understands it.
 ALLOW_SCRIPTS=""
 if npm install --help 2>&1 | grep -q -- "--allow-scripts"; then
   ALLOW_SCRIPTS="--allow-scripts=context-mode,better-sqlite3,esbuild"
@@ -77,8 +80,9 @@ fi
 
 # ── 2. Build ────────────────────────────────────────────────────────────────────
 say "Installing dependencies and building"
-# shellcheck disable=SC2086
-run npm --prefix "$FORK_DIR" install --no-audit --no-fund $ALLOW_SCRIPTS
+# No --allow-scripts here: npm rejects that flag in project-scoped installs. The project's own
+# package.json carries `allowScripts` for its dependencies instead.
+run npm --prefix "$FORK_DIR" install --no-audit --no-fund
 run npm --prefix "$FORK_DIR" run build
 if [ "$DRY_RUN" != "1" ] && [ ! -f "$FORK_DIR/build/cli.js" ]; then
   echo "Build did not produce build/cli.js — aborting." >&2
