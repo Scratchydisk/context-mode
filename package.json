@@ -72,6 +72,7 @@
     ".openclaw-plugin",
     "openclaw.plugin.json",
     "start.mjs",
+    "scripts/build-if-needed.mjs",
     "scripts/postinstall.mjs",
     "scripts/heal-better-sqlite3.mjs",
     "scripts/heal-installed-plugins.mjs",

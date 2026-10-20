@@ -20,6 +20,22 @@ if (process.env.CONTEXT_MODE_SKIP_BUILD === "1") {
   process.exit(0);
 }
 
+// The build toolchain is a devDependency. A production install (`npm install --production`, which
+// is what the in-place upgrade runs) has no devDependencies, so there is nothing to build with.
+// The package is already built in that case — the copy carried build/ over — so skip rather than
+// fail the install.
+function hasToolchain() {
+  return (
+    existsSync(join(ROOT, "node_modules", "typescript", "bin", "tsc")) &&
+    existsSync(join(ROOT, "node_modules", "esbuild"))
+  );
+}
+
+if (!hasToolchain()) {
+  console.log("context-mode: no build toolchain (devDependencies absent) — skipping build");
+  process.exit(0);
+}
+
 function newestMtime(dir) {
   let newest = 0;
   let entries;
