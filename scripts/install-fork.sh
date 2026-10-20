@@ -49,6 +49,14 @@ run()  { if [ "$DRY_RUN" = "1" ]; then info "[dry-run] $*"; else "$@"; fi; }
 command -v npm >/dev/null 2>&1 || { echo "npm is required" >&2; exit 1; }
 command -v node >/dev/null 2>&1 || { echo "node is required" >&2; exit 1; }
 
+# npm 11 gates lifecycle scripts behind an allow-list. Without this, `prepare` (the build) and
+# `postinstall` (the better-sqlite3 heal) are skipped and the install is broken. Older npm has no
+# such flag and runs everything, so the flag is only added when npm understands it.
+ALLOW_SCRIPTS=""
+if npm install --help 2>&1 | grep -q -- "--allow-scripts"; then
+  ALLOW_SCRIPTS="--allow-scripts=context-mode,better-sqlite3,esbuild"
+fi
+
 FORK_JSON="$HOME/.context-mode/fork.json"
 
 say "Fork install"
@@ -69,7 +77,8 @@ fi
 
 # ── 2. Build ────────────────────────────────────────────────────────────────────
 say "Installing dependencies and building"
-run npm --prefix "$FORK_DIR" install --no-audit --no-fund
+# shellcheck disable=SC2086
+run npm --prefix "$FORK_DIR" install --no-audit --no-fund $ALLOW_SCRIPTS
 run npm --prefix "$FORK_DIR" run build
 if [ "$DRY_RUN" != "1" ] && [ ! -f "$FORK_DIR/build/cli.js" ]; then
   echo "Build did not produce build/cli.js — aborting." >&2
@@ -80,9 +89,13 @@ fi
 # This replaces the global `context-mode` package. On a machine where it was installed through
 # the Claude Code plugin marketplace it is a symlink into ~/.claude/plugins/cache/...; npm
 # removes the symlink, not the cache directory it points at.
+#
+# A local-path install is linked, not copied: the global `context-mode` always runs the code in
+# $FORK_DIR, so an edit there takes effect on the next run.
 say "Installing globally"
 info "this replaces the global 'context-mode' package"
-run npm install -g --no-audit --no-fund "$FORK_DIR"
+# shellcheck disable=SC2086
+run npm install -g --no-audit --no-fund $ALLOW_SCRIPTS "$FORK_DIR"
 
 # ── 4. Point the upgrade at the fork ────────────────────────────────────────────
 # Without this, /ctx-upgrade clones upstream and overwrites the install with upstream's files.
@@ -141,6 +154,10 @@ fi
 
 # ── 7. Verify ───────────────────────────────────────────────────────────────────
 say "Done"
-info "installed:  $(npm ls -g context-mode --depth=0 2>/dev/null | tail -1 || echo 'context-mode')"
-info "check with: context-mode doctor"
-info "upgrade with: context-mode upgrade   (pulls $FORK_REPO)"
+if [ "$DRY_RUN" != "1" ]; then
+  info "global package: $(npm ls -g context-mode --depth=0 2>/dev/null | grep -o 'context-mode@[^ ]*' | head -1 || echo 'context-mode')"
+  info "fork config:    $FORK_JSON"
+fi
+info "check with:    context-mode doctor"
+info "upgrade with:  context-mode upgrade   (pulls $FORK_REPO)"
+info "note:          'npm update -g context-mode' still pulls upstream — the package name is the same"
