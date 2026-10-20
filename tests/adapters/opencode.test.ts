@@ -177,8 +177,11 @@ describe("OpenCodeAdapter", () => {
   // ── Config paths ──────────────────────────────────────
 
   describe("config paths", () => {
-    it("settings path is opencode.json (relative)", () => {
-      expect(adapter.getSettingsPath()).toBe(resolve("opencode.json"));
+    it("settings path falls back to the global config when none exists", () => {
+      // Not a project-relative path: with no config anywhere, writing one into the current
+      // directory would leave a stray opencode.json wherever the command ran, and it would
+      // shadow the global config rather than extend it.
+      expect(adapter.getSettingsPath()).toBe(join(homedir(), ".config", "opencode", "opencode.json"));
     });
 
     it("session dir is under platform-specific config directory", () => {
@@ -857,8 +860,8 @@ describe("OpenCodeAdapter for KiloCode", () => {
   });
 
   describe("config paths", () => {
-    it("settings path is kilo.json (relative)", () => {
-      expect(adapter.getSettingsPath()).toBe(resolve("kilo.json"));
+    it("settings path falls back to the global config when none exists", () => {
+      expect(adapter.getSettingsPath()).toBe(join(homedir(), ".config", "kilo", "kilo.json"));
     });
 
     it("session dir is under platform-specific config directory", () => {

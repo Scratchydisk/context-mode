@@ -257,14 +257,20 @@ export class OpenCodeAdapter extends BaseAdapter implements HookAdapter {
   getSettingsPath(): string {
     if (this.settingsPath) return this.settingsPath;
     // Edge case (#849): writeSettings() called without a prior readSettings()
-    // (which is what populates this.settingsPath). Never create a `.json` that
-    // would shadow an existing `.jsonc` — OpenCode merges the project-root
-    // `.jsonc` LAST, so it is the authoritative config
-    // (refs/platforms/opencode/packages/opencode/src/config/config.ts:406-408
-    // + paths.ts:15-22). Prefer the existing `.jsonc` as the write target.
-    const jsoncPath = resolve(`${this.platform}.jsonc`);
-    if (existsSync(jsoncPath)) return jsoncPath;
-    return resolve(`${this.platform}.json`);
+    // (which is what populates this.settingsPath).
+    //
+    // Prefer an existing config, in the same order paths() searches: the project-local `.jsonc`
+    // first, because OpenCode merges the project-root `.jsonc` LAST, so it is the authoritative
+    // config (refs/platforms/opencode/packages/opencode/src/config/config.ts:406-408 +
+    // paths.ts:15-22), and writing into a `.json` that shadows it destroys the user's settings.
+    //
+    // With no config anywhere, the target is the global file. Creating one in the current
+    // directory instead would leave a stray opencode.json wherever the command happened to run,
+    // and that file would shadow the global config rather than extend it.
+    for (const candidate of this.paths()) {
+      if (existsSync(candidate)) return candidate;
+    }
+    return join(homedir(), ".config", this.platform, `${this.platform}.json`);
   }
 
   private paths(): string[] {
