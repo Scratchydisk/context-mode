@@ -551,8 +551,7 @@ export class OpenCodeAdapter extends BaseAdapter implements HookAdapter {
           /* not a package directory */
         }
       }
-    }
-    // Check ~/.cache/opencode/node_modules/ for context-mode
+    }    // Check ~/.cache/opencode/node_modules/ for context-mode
     try {
       const pkgPath = resolve(
         homedir(),
@@ -705,9 +704,38 @@ export class OpenCodeAdapter extends BaseAdapter implements HookAdapter {
     // Both keys are checked: OpenCode 2 reads `plugins` and merges the legacy `plugin` key into the
     // same list, so an entry under either key means the plugin is registered.
     for (const key of ["plugin", "plugins"]) {
-      const plugins = settings[key];
-      if (Array.isArray(plugins) && plugins.some((p: unknown) => typeof p === "string" && p.includes("context-mode"))) {
-        return true;
+      const list = settings[key];
+      if (!Array.isArray(list)) continue;
+      for (const spec of list) {
+        if (this.specIsContextMode(spec)) return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Whether one entry in the plugin array refers to context-mode.
+   *
+   * The entry can be a bare npm spec (`"context-mode"`), a local directory (a fork install points
+   * at its own directory, whose name need not contain "context-mode"), or the object form
+   * `{ package, options }`.
+   */
+  private specIsContextMode(spec: unknown): boolean {
+    const target =
+      typeof spec === "string"
+        ? spec
+        : typeof spec === "object" && spec !== null
+          ? (spec as { package?: unknown }).package
+          : undefined;
+    if (typeof target !== "string") return false;
+    if (target.includes("context-mode")) return true;
+    if (target.startsWith("/") || target.startsWith("file://")) {
+      const dir = target.startsWith("file://") ? fileURLToPath(target) : target;
+      try {
+        const pkg = JSON.parse(readFileSync(resolve(dir, "package.json"), "utf-8")) as { name?: string };
+        return pkg.name === "context-mode";
+      } catch {
+        return false;
       }
     }
     return false;

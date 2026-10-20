@@ -305,8 +305,40 @@ describe("OpenCodeAdapter", () => {
       }
     });
 
-    it("getInstalledVersion reads the version from a local plugin directory", () => {
+    it("validateHooks passes when the plugins entry is a local directory named anything", () => {
+      // A fork install points the `plugins` array at its own directory, whose name need not
+      // contain "context-mode" — the package.json inside it is what identifies the package.
       const root = mkdtempSync(join(tmpdir(), "opencode-adapter-"));
+      const dir = join(root, "project");
+      const home = join(root, "home");
+      const pkgDir = join(root, "install-dir");
+      mkdirSync(dir, { recursive: true });
+      mkdirSync(pkgDir, { recursive: true });
+      writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "context-mode", version: "1.2.3" }) + "\n");
+      writeFileSync(join(dir, "opencode.json"), JSON.stringify({ plugins: [pkgDir] }, null, 2) + "\n");
+
+      const prevHome = process.env.HOME;
+      const prevUserProfile = process.env.USERPROFILE;
+      Object.assign(process.env, env(home));
+      const cwd = process.cwd();
+      process.chdir(dir);
+      try {
+        const results = new OpenCodeAdapter().validateHooks("/tmp/plugin");
+        expect(results).toContainEqual(expect.objectContaining({
+          check: "Plugin registration",
+          status: "pass",
+        }));
+      } finally {
+        process.chdir(cwd);
+        if (prevHome !== undefined) process.env.HOME = prevHome;
+        else delete process.env.HOME;
+        if (prevUserProfile !== undefined) process.env.USERPROFILE = prevUserProfile;
+        else delete process.env.USERPROFILE;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("getInstalledVersion reads the version from a local plugin directory", () => {      const root = mkdtempSync(join(tmpdir(), "opencode-adapter-"));
       const dir = join(root, "project");
       const home = join(root, "home");
       const pkgDir = join(root, "pkg");
