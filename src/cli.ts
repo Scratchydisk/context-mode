@@ -1158,10 +1158,18 @@ async function doctor(): Promise<number> {
   const installedVersion = adapter.getInstalledVersion();
 
   if (latestVersion === "unknown") {
-    p.log.warn(
-      color.yellow("npm (MCP): WARN") +
-        ` — local v${localVersion}, could not reach npm registry`,
-    );
+    if (updateRegistryUrl() === null) {
+      // The check is disabled on purpose — this build is not published to npm, so there is nothing
+      // to compare against. Reporting "could not reach npm registry" would be a false alarm.
+      p.log.info(
+        color.dim("npm (MCP): SKIP — version check disabled for this install"),
+      );
+    } else {
+      p.log.warn(
+        color.yellow("npm (MCP): WARN") +
+          ` — local v${localVersion}, could not reach npm registry`,
+      );
+    }
   } else if (localVersion === latestVersion) {
     p.log.success(
       color.green("npm (MCP): PASS") +
