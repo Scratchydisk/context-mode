@@ -5,7 +5,7 @@ living in one person's notes.
 
 ## `opencode-v2-entry.patch`
 
-**Target:** `mksglu/context-mode`, branch `v2-design`
+**Target:** `mksglu/context-mode`, branch `v2-design` (base commit `003b8d60`)
 **Upstream PR:** none — upstream has pull requests and issues disabled, and `main` is a frozen v1
 branch. The upstream rewrite is happening on `v2-design` and the surrounding `impl/M*` branches.
 
