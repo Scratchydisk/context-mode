@@ -28,6 +28,7 @@ import {
 import { resolve, join, dirname, extname, basename } from "node:path";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import { BaseAdapter, resolveContextModeDataRoot } from "../base.js";
 import { stripJsonComments } from "../../util/jsonc.js";
@@ -438,15 +439,21 @@ export class OpenCodeAdapter extends BaseAdapter implements HookAdapter {
       return results;
     }
 
-    // Check for "context-mode" in plugin array
+    // Check for "context-mode" in the plugin array. OpenCode 2 reads `plugins` and merges the legacy
+    // `plugin` key into the same list, so either key counts.
     const hasPlugin = this.hasContextModePlugin(settings);
-    if (Array.isArray(settings.plugin)) {
+    const pluginKey = Array.isArray(settings.plugins)
+      ? "plugins"
+      : Array.isArray(settings.plugin)
+        ? "plugin"
+        : undefined;
+    if (pluginKey !== undefined) {
       results.push({
         check: "Plugin registration",
         status: hasPlugin ? "pass" : "fail",
         message: hasPlugin
-          ? "context-mode found in plugin array"
-          : "context-mode not found in plugin array",
+          ? `context-mode found in ${pluginKey} array`
+          : `context-mode not found in ${pluginKey} array`,
         fix: hasPlugin
           ? undefined
           : "context-mode upgrade",
@@ -507,6 +514,38 @@ export class OpenCodeAdapter extends BaseAdapter implements HookAdapter {
   }
 
   getInstalledVersion(): string {
+    // OpenCode 2 loads the plugin from the `plugins` array, which may point at a directory on disk
+    // (a fork install) rather than a package in OpenCode's npm cache. Read the version from
+    // whichever location the config actually names.
+    const settings = this.readSettings();
+    const specs: unknown[] = [];
+    for (const key of ["plugins", "plugin"]) {
+      const list = settings?.[key];
+      if (Array.isArray(list)) specs.push(...list);
+    }
+    for (const spec of specs) {
+      const target =
+        typeof spec === "string"
+          ? spec
+          : typeof spec === "object" && spec !== null
+            ? (spec as { package?: unknown }).package
+            : undefined;
+      if (typeof target !== "string") continue;
+      // A local directory: read its package.json. A bare spec is an npm package name — the version
+      // lives in OpenCode's npm cache, which is checked below.
+      if (target.startsWith("/") || target.startsWith("file://")) {
+        const dir = target.startsWith("file://") ? fileURLToPath(target) : target;
+        try {
+          const pkg = JSON.parse(readFileSync(resolve(dir, "package.json"), "utf-8")) as {
+            name?: string;
+            version?: string;
+          };
+          if (pkg.name === "context-mode" && typeof pkg.version === "string") return pkg.version;
+        } catch {
+          /* not a package directory */
+        }
+      }
+    }
     // Check ~/.cache/opencode/node_modules/ for context-mode
     try {
       const pkgPath = resolve(

@@ -271,6 +271,64 @@ describe("OpenCodeAdapter", () => {
       rmSync(root, { recursive: true, force: true });
     });
 
+    it("validateHooks passes on the OpenCode 2 'plugins' key", () => {
+      const root = mkdtempSync(join(tmpdir(), "opencode-adapter-"));
+      const dir = join(root, "project");
+      const home = join(root, "home");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "opencode.json"), JSON.stringify({
+        plugins: ["/opt/context-mode"],
+      }, null, 2) + "\n");
+
+      const prevHome = process.env.HOME;
+      const prevUserProfile = process.env.USERPROFILE;
+      Object.assign(process.env, env(home));
+      const cwd = process.cwd();
+      process.chdir(dir);
+      try {
+        const results = new OpenCodeAdapter().validateHooks("/tmp/plugin");
+        expect(results).toContainEqual(expect.objectContaining({
+          check: "Plugin registration",
+          status: "pass",
+          message: "context-mode found in plugins array",
+        }));
+      } finally {
+        process.chdir(cwd);
+        if (prevHome !== undefined) process.env.HOME = prevHome;
+        else delete process.env.HOME;
+        if (prevUserProfile !== undefined) process.env.USERPROFILE = prevUserProfile;
+        else delete process.env.USERPROFILE;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("getInstalledVersion reads the version from a local plugin directory", () => {
+      const root = mkdtempSync(join(tmpdir(), "opencode-adapter-"));
+      const dir = join(root, "project");
+      const home = join(root, "home");
+      const pkgDir = join(root, "pkg");
+      mkdirSync(dir, { recursive: true });
+      mkdirSync(pkgDir, { recursive: true });
+      writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "context-mode", version: "9.9.9" }) + "\n");
+      writeFileSync(join(dir, "opencode.json"), JSON.stringify({ plugins: [pkgDir] }, null, 2) + "\n");
+
+      const prevHome = process.env.HOME;
+      const prevUserProfile = process.env.USERPROFILE;
+      Object.assign(process.env, env(home));
+      const cwd = process.cwd();
+      process.chdir(dir);
+      try {
+        expect(new OpenCodeAdapter().getInstalledVersion()).toBe("9.9.9");
+      } finally {
+        process.chdir(cwd);
+        if (prevHome !== undefined) process.env.HOME = prevHome;
+        else delete process.env.HOME;
+        if (prevUserProfile !== undefined) process.env.USERPROFILE = prevUserProfile;
+        else delete process.env.USERPROFILE;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
     it("validateHooks warns when a legacy mcp.context-mode block remains after upgrade (#574)", () => {
       const root = mkdtempSync(join(tmpdir(), "opencode-adapter-"));
       const dir = join(root, "project");
