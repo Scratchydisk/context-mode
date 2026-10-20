@@ -126,6 +126,12 @@ Two things to know:
 - `npm ls -g context-mode` shows the fork's version, which matches upstream's version number. The
   fork's own changes are visible in `context-mode doctor` and in the OpenCode 2 support.
 
+OpenCode 2 loads the fork through the `plugins` array, pointed at this install's directory rather
+than the bare name `context-mode` — a bare name is an npm package, so OpenCode would install
+upstream's build and load that instead. Upstream's published package cannot load under OpenCode 2 at
+all (`Plugin must export a default definition with an id and an effect or setup function`); this
+fork's `index.js` at the package root is the entrypoint OpenCode 2 resolves.
+
 ## Install
 
 Platforms are grouped by install complexity. Hook-capable platforms get automatic routing enforcement. Non-hook platforms need a one-time routing file copy.
