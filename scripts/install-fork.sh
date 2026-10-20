@@ -140,32 +140,58 @@ else
   CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/marketplaces/context-mode"
   if [ -d "$CLAUDE_DIR/.git" ]; then
     say "Repointing the Claude Code marketplace clone at the fork"
-    run git -C "$CLAUDE_DIR" remote set-url origin "https://github.com/$FORK_REPO.git"
-    info "origin -> https://github.com/$FORK_REPO.git"
+    run git -C "$CLAUDE_DIR" remote set-url origin "$FORK_URL"
+    info "origin -> $FORK_URL"
   else
     warn "no Claude Code marketplace clone at $CLAUDE_DIR — skipping"
     info "if Claude Code installs context-mode, re-run with the clone present, or:"
-    info "  git -C '$CLAUDE_DIR' remote set-url origin https://github.com/$FORK_REPO.git"
+    info "  git -C '$CLAUDE_DIR' remote set-url origin $FORK_URL"
   fi
 fi
 
-# ── 6. Wire OpenCode 2 ──────────────────────────────────────────────────────────
-# OpenCode 2 reads the `plugins` array. A bare "context-mode" entry is an npm package name:
-# OpenCode would install upstream's build from the registry. The install must therefore point at
-# this install's own directory.
+# ── 6. Wire the platforms ───────────────────────────────────────────────────────
+# The config writes live in `context-mode upgrade`, not in this script: it knows each platform's
+# config shape, the jsonc rules, which key each host version reads, and which registry entries to
+# repoint. Calling it here means one command sets a machine up, instead of one command plus a
+# reminder to run a second one.
+#
+#   context-mode upgrade --platform opencode
+#     writes the `plugins` array pointing at this install (a bare "context-mode" spec would make
+#     OpenCode npm-install upstream's build), and clears the legacy `plugin` key
+#   context-mode upgrade --platform claude-code
+#     repoints ~/.claude/plugins/known_marketplaces.json at the fork — left at upstream, the next
+#     marketplace refresh re-clones upstream and reinstalls the plugin from upstream's build
+wire() {
+  local platform="$1"
+  if [ "$DRY_RUN" = "1" ]; then
+    info "[dry-run] would run: context-mode upgrade --platform $platform"
+    return 0
+  fi
+  say "Wiring $platform"
+  if node "$FORK_DIR/cli.bundle.mjs" upgrade --platform "$platform"; then
+    info "$platform wired"
+  else
+    warn "the $platform upgrade did not complete — re-run 'context-mode upgrade --platform $platform'"
+  fi
+}
+
 if [ "$SKIP_OPENCODE" = "1" ]; then
   warn "skipping the OpenCode config"
 elif ! command -v opencode >/dev/null 2>&1; then
   warn "opencode is not on PATH — skipping the OpenCode config"
+  info "install OpenCode, then run: context-mode upgrade --platform opencode"
 else
   OC_MAJOR="$(opencode --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1 | cut -d. -f1 || true)"
-  if [ "${OC_MAJOR:-0}" -lt 2 ] 2>/dev/null; then
-    say "OpenCode ${OC_MAJOR:-?} detected — leaving the config alone"
-    info "OpenCode 1 uses the legacy 'plugin' key; the fork's setup writes it"
-  else
-    say "Wiring OpenCode ${OC_MAJOR}.x"
-    info "run: context-mode upgrade   (writes the 'plugins' entry pointing at this install)"
-  fi
+  info "OpenCode ${OC_MAJOR:-?} detected"
+  wire opencode
+fi
+
+if [ "$SKIP_CLAUDE" = "1" ]; then
+  warn "skipping the Claude Code config"
+elif [ -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" ]; then
+  wire claude-code
+else
+  info "no Claude Code config at ${CLAUDE_CONFIG_DIR:-$HOME/.claude} — skipping"
 fi
 
 # ── 7. Verify ───────────────────────────────────────────────────────────────────
@@ -177,3 +203,6 @@ fi
 info "check with:    context-mode doctor"
 info "upgrade with:  context-mode upgrade   (pulls $FORK_REPO)"
 info "note:          'npm update -g context-mode' still pulls upstream — the package name is the same"
+if command -v opencode >/dev/null 2>&1; then
+  info "restart:       restart OpenCode so it picks up the plugin"
+fi
