@@ -1,0 +1,788 @@
+From 811cae9c0e36f37f76fdb2469ae7e3f984f9005e Mon Sep 17 00:00:00 2001
+From: Scratchydisk <stewart@amiwill.co.uk>
+Date: Tue, 20 Oct 2026 08:19:19 +0100
+Subject: [PATCH] fix(opencode): rewrite the OpenCode 2 plugin entry against
+ the v2 plugin API
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+src/entries/opencode.ts registered the v1 hook names (chat.message,
+tool.execute.before, experimental.session.compacting,
+experimental.chat.system.transform) and called app.tool(name, def). None of
+those exist in OpenCode 2's plugin API, the v2 loader reads id/setup off the
+default export, and the entry had no default export at all — the module could
+not load under OpenCode 2.
+
+Rewritten against the v2 plugin context:
+
+  - tools: ctx.tool.transform(editor => editor.add(...)), codemode: false so
+    the model can call the ctx_* tools directly (#1171)
+  - tool hooks: ctx.tool.hook("execute.before" / "execute.after")
+  - session hooks: ctx.session.hook("prompt" / "context" / "compaction")
+  - events: ctx.event.subscribe(), with session.step.ended as the live source
+    and message.part.updated kept as the fallback
+  - cwd: ctx.location.directory
+  - the module now default-exports { id, setup }
+
+The system payload merges into the last SystemPart instead of adding one, so
+system.length is unchanged and the provider prompt cache survives (#1085).
+
+Compaction ownership and the destructive-tool policy are ported from
+mksglu/context-mode#1194: in the default "own" mode the compaction hook
+supplies event.result = { summary } so the host skips its own model
+summarization call; "passthrough" leaves it to the host. ctx_purge and
+ctx_upgrade are refused unless CONTEXT_MODE_ALLOW_DESTRUCTIVE=1. The summary
+text is produced inside core (compactionSummary) so the entry still never
+opens context.db.
+
+The v1 names are absent from v2 core (opencode@1438073
+packages/plugin/src/promise/session.ts:138-151, promise/tool.ts:38-64;
+tickets/spike-hooks-verified.md:47). impl/12 §4 already requires {id, setup}
+and the ctx.tool.transform/editor.add pattern, so this entry now matches its
+own spec.
+
+tests/v2/plugins/opencode.test.mjs covers the v2 surface (tool registration,
+hook names, cleanup), the compaction ownership modes, and the destructive-tool
+policy.
+---
+ docs/v2/impl/DEVIATIONS.md         |   1 +
+ src/core/hooks/dispatch.ts         |  14 +
+ src/entries/opencode.ts            | 422 +++++++++++++++++++++++------
+ tests/v2/plugins/opencode.test.mjs | 212 +++++++++++++--
+ 4 files changed, 530 insertions(+), 119 deletions(-)
+
+diff --git a/docs/v2/impl/DEVIATIONS.md b/docs/v2/impl/DEVIATIONS.md
+index 57dc9fbd..23ac027c 100644
+--- a/docs/v2/impl/DEVIATIONS.md
++++ b/docs/v2/impl/DEVIATIONS.md
+@@ -452,3 +452,4 @@ One row per deviation found while implementing or verifying against the design.
+ | 2026-10-19 | `scripts/gate.mjs` live (D-M7-gate-2) | BLOCKED-M7 item 5: live step printed PASS with 0/31 cases run. | 0 live cases run now prints `SKIP` with the reason (no case covers the changed files; run by hand with --all, ADR-0012). A missing "N/M cases" header is FAIL. The gate runs no more live cases than before. | PASS must mean cases ran. Live runs cost money and are by hand. |
+ | 2026-10-19 | `src/core/store/fts.ts` `rankTexts`, `src/core/store/schema.ts` `FTS_TOKENIZE`, `tests/v2/store/fts.test.mjs` (D-M7-FT-1) | BLOCKED-M7 item 2: T-F1 Case B 1 MiB PostToolUse wall p95 150-155 ms > HOOK_COMBINED_P95_MS 60. The profile put about 19 ms per call in `rankTexts`. Can the in-memory BM25 be cheaper with the same scores? | Yes. `rankTexts` now builds a one-column contentless FTS5 table (`fts5(body, <FTS_TOKENIZE>, content='')`, rowid = index + 1) instead of running the full migration and inserting into the six-column `chunks` table. The tokenizer literal moves to one export, `FTS_TOKENIZE`, used by the `chunks` DDL and by the scratch table, so V24 still has one source. | `bm25()` reads only indexed columns; the other five `chunks` columns are UNINDEXED, so the column count, token counts and averages are the same and the scores are equal to the bit. A new test checks this against the migrated `chunks` table over 403 texts (diacritics, Cyrillic, combining marks, empty, lone surrogate) and 8 queries with `deepEqual`. In-process, 10.7k texts (1 MiB): 18.6 -> 12.8 ms median. No search result changes. |
+ | 2026-10-19 | `src/core/hooks/dispatch.ts` PostToolUse step 5, `src/core/index/text.ts` `storeText`/`indexText` (D-M7-FT-2) | BLOCKED-M7 item 2: the Case B/C path chunked the text twice above `SYNC_INDEX_MAX_BYTES` (once to select, once more inside the detached `indexText`), and at or below it read every chunk back from the DB (`selectChunks`) after writing them. Can one chunk pass serve both? | Yes. Step 5 calls `chunkText(text, "text")` once; the same array goes to `indexText` (new optional last argument `chunks`, which must equal `chunkText(text, kind)`; other callers do not pass it) and to `selectChunksInMemory`, for both sizes. The F1 split stays: at or below 65536 bytes the FTS5 write is inline before the answer, above it detached. | DECISIONS-r9 F1 already states the in-memory form has "same scoring, selection, `more` rule and shape" as the DB form; the stored rows are these chunks (`body` = `text`, `ord` = `ord`, label = label), so the selection is the same. One edge: a lone UTF-16 surrogate, which SQLite stores as U+FFFD, now reaches the reply as written instead of as U+FFFD at or below 65536 bytes, the same as the existing above-65536 path; byte counts do not change (`Buffer.byteLength` counts it as the 3-byte U+FFFD). |
++| 2026-10-20 | `src/entries/opencode.ts` | The entry registered the v1 hook names (`chat.message`, `tool.execute.before`, `experimental.session.compacting`, `experimental.chat.system.transform`) and called `app.tool(name, def)`. None of those exist in OpenCode 2's plugin API, the v2 loader reads `id`/`setup` off the **default** export, and the entry had no default export at all — so the module could not load under OpenCode 2. | Rewritten against the v2 plugin context: tools register through `ctx.tool.transform(editor => editor.add(...))`; hooks register through `ctx.tool.hook("execute.before"/"execute.after")`, `ctx.session.hook("prompt"/"context"/"compaction")` and `ctx.event.subscribe()`; `cwd` comes from `ctx.location.directory`; the module now default-exports `{id, setup}`. The system payload merges into the last `SystemPart` instead of adding one, so `system.length` is unchanged (#1085). Compaction ownership (`own`/`passthrough`) and the destructive-tool policy are ported from mksglu/context-mode#1194, with the summary text produced inside core (`compactionSummary`) so the entry still never opens context.db. | The v1 names are absent from v2 core: `opencode@1438073 packages/plugin/src/promise/session.ts:138-151` (SessionHooks = prompt, context, compaction), `promise/tool.ts:38-64` (ToolHooks = execute.before, execute.after, registered via `ctx.tool.hook`), `tickets/spike-hooks-verified.md:47` "v1 names are absent from v2 core". `docs/install/opencode.md` and `docs/v2/review/out/final/probe-opencode.md` were both checked against `opencode-ai@1.19.3` — the v1-era plugin API — which is why the probe and this entry disagreed about which API the v2 plugin targets. impl/12 §4 already requires `{id, setup}` and the `ctx.tool.transform`/`editor.add` pattern, so the entry now matches its own spec; the install guide's plugin-file shape is a separate follow-up (it still describes a v1-era `.opencode/plugins/context-mode.js`). |
+diff --git a/src/core/hooks/dispatch.ts b/src/core/hooks/dispatch.ts
+index 5aac8b5c..7f0c071a 100644
+--- a/src/core/hooks/dispatch.ts
++++ b/src/core/hooks/dispatch.ts
+@@ -106,6 +106,20 @@ function compactText(db: DbHandle, ev: CanonicalHookEvent, row: AdapterRow): str
+   return renderState(readSessionEvents(db, ev.sessionId), ev.turn ?? 0);
+ }
+ 
++// The OpenCode 2 compaction hook owns the summary in "own" mode and needs the text to put in
++// `event.result`, so OpenCode skips its own model summarization call (ported from
++// mksglu/context-mode#1194). The DB stays inside core: the plugin entry never opens context.db
++// (impl/12 §1), so the summary is produced here and handed over as text.
++export async function compactionSummary(project: ProjectContext, sessionId: string, turn: number): Promise<string> {
++  if (sessionId === "") return "";
++  const db = await openDb(project);
++  const rows = readSessionEvents(db, sessionId);
++  // An empty session has nothing to summarise: an empty summary would still suppress the host's own
++  // summarization, so the host is left to do it (ported from mksglu/context-mode#1194).
++  if (rows.length === 0) return "";
++  return renderState(rows, turn);
++}
++
+ async function sessionStart(ev: CanonicalHookEvent, row: AdapterRow, project: ProjectContext): Promise<Decision> {
+   if (ev.source === "compact" && row.compactDelivery === "sessionstart") {
+     const db = await openDb(project);
+diff --git a/src/entries/opencode.ts b/src/entries/opencode.ts
+index 7a8b4d4b..aa511db0 100644
+--- a/src/entries/opencode.ts
++++ b/src/entries/opencode.ts
+@@ -1,41 +1,140 @@
+-// impl/12 §4 (OpenCode 2 plugin), impl/10 §11; DEVIATIONS D-M5-arch-2, D-M5-A1-1, D-M5-P2-1..4.
++// src/entries/opencode.ts — OpenCode 2 plugin, in-process (impl/12 §4, impl/10 §11; DEVIATIONS D-M5-arch-2,
++// D-M5-A1-1, D-M5-P2-1..4).
++//
++// OpenCode 2's plugin API is a *default export* whose `setup(ctx)` registers hooks, transforms and
++// tools **through the plugin context**. It does not read a V1-shaped hook map off the return value,
++// and it has no `app.tool()` method. The V1 hook names do not exist in v2:
++//
++//   opencode@1438073 packages/plugin/src/promise/session.ts:138-151 — SessionHooks = prompt, context, compaction
++//   opencode@1438073 packages/plugin/src/promise/tool.ts:38-64     — ToolHooks = execute.before, execute.after
++//   tickets/spike-hooks-verified.md:47                              — "v1 names are absent from v2 core"
++//
++//   V1 hook                              V2 API
++//   tool.execute.before                  ctx.tool.hook("execute.before", …)
++//   tool.execute.after                   ctx.tool.hook("execute.after", …)
++//   chat.message                         ctx.session.hook("prompt", …)
++//   experimental.session.compacting      ctx.session.hook("compaction", …)
++//   experimental.chat.system.transform   ctx.session.hook("context", …)
++//   tool map                             ctx.tool.transform(editor => editor.add(…))
++//   event (message.part.updated)         ctx.event.subscribe()
++//
+ // In-process: no spawn, no MCP hop (impl/12 §1). Every hook builds the raw call-site object the
+ // opencode adapter decodes (D-M5-A1-1) and calls handleHook; this file never opens context.db.
++//
++// Compaction ownership (ported from mksglu/context-mode#1194): in the default "own" mode the
++// compaction hook supplies `event.result = { summary }`, so OpenCode skips its own model
++// summarization call entirely — zero LLM calls, deterministic output. "passthrough" (alias "host")
++// leaves `result` unset and the host model narrates; the state block is still produced for resume.
++import { z } from "zod/v4";
+ import { INTERNAL_ERROR_LINE, PLUGIN_ID } from "../core/contracts/constants.ts";
+-import { CtxError } from "../core/contracts/errors.ts";
++import { CtxError, formatError } from "../core/contracts/errors.ts";
+ import type { HookOutput, ProjectContext, ToolContext } from "../core/contracts/types.ts";
+-import { handleHook } from "../core/hooks/dispatch.ts";
++import { compactionSummary, handleHook } from "../core/hooks/dispatch.ts";
+ import { resolveProject } from "../core/project/resolve.ts";
+ import { TOOLS, type RegisteredTool } from "../core/tools/registry.ts";
+ import { INSTRUCTIONS } from "../prompt/_generated.ts";
+ 
+ const AGENT = "opencode";
+ 
+-/** OpenCode's `app` handle at plugin load: `directory` is the spawn cwd (impl/12 §4.3 step 1). */
+-export interface OpenCodeApp {
+-  directory?: string;
+-  tool(name: string, def: OpenCodeToolDef): void;
++/** A host registration handle. `dispose` releases the hook/transform (OpenCode's `Registration`). */
++export interface OpenCodeV2Registration {
++  dispose?: () => Promise<void> | void;
+ }
+ 
+-/** One ctx_* tool as OpenCode registers it (#1171). */
+-export interface OpenCodeToolDef {
++/** One ctx_* tool as OpenCode 2 registers it (#1171). */
++export interface OpenCodeV2ToolDef {
++  name: string;
+   description: string;
+-  args: RegisteredTool<unknown>["schema"];
+-  execute(args: unknown, toolCtx: { sessionID?: string; abort?: AbortSignal }): Promise<string>;
++  input: unknown;
++  options?: { namespace?: string; codemode?: boolean };
++  execute(input: unknown, context: { signal?: AbortSignal; sessionID?: string }): Promise<unknown>;
+ }
+ 
+-interface ToolInput { tool?: string; sessionID?: string; callID?: string; args?: unknown }
+-interface TextPart { type?: string; text?: string }
+-interface BusEvent { type?: string; properties?: { part?: { type?: string; sessionID?: string } } }
++/** The slice of OpenCode 2's tool editor this file uses. */
++export interface OpenCodeV2ToolEditor {
++  add(tool: OpenCodeV2ToolDef): void;
++}
++
++/** The slice of OpenCode 2's plugin context this file uses (impl/12 §4). */
++export interface OpenCodeV2Context {
++  location?: { directory?: string; project?: { id: string; directory: string; canonical: string } };
++  options?: Record<string, unknown>;
++  session: {
++    hook(name: "prompt" | "context" | "compaction", callback: (event: unknown) => unknown): Promise<OpenCodeV2Registration>;
++  };
++  tool: {
++    hook(name: "execute.before" | "execute.after", callback: (event: unknown) => unknown): Promise<OpenCodeV2Registration>;
++    transform(callback: (editor: OpenCodeV2ToolEditor) => void): Promise<OpenCodeV2Registration>;
++  };
++  event: { subscribe(options?: { signal?: AbortSignal }): AsyncIterable<unknown> };
++}
++
++/**
++ * Compaction posture, configurable via the plugin entry's `options.compaction`
++ * (ported from mksglu/context-mode#1194).
++ *
++ * - "own" (default): the state block becomes the compaction summary (`event.result = { summary }`),
++ *   so the host's model summarization call is skipped — deterministic and model-cost-free.
++ * - "passthrough" (alias "host"): `result` is left unset so the host model narrates its own summary.
++ */
++export type CompactionMode = "own" | "passthrough";
++
++export function resolveCompactionMode(raw: unknown): CompactionMode {
++  const v = String(raw ?? "").trim().toLowerCase();
++  return v === "passthrough" || v === "host" ? "passthrough" : "own";
++}
++
++/**
++ * Destructive tools the V2 host cannot gate per call (ported from mksglu/context-mode#1194). A plugin
++ * tool cannot raise a host permission request, so context-mode owns their in-execute policy: refused
++ * by default, opt in via `CONTEXT_MODE_ALLOW_DESTRUCTIVE=1`. Non-destructive tools are always allowed.
++ */
++const DESTRUCTIVE_TOOLS = new Set(["ctx_purge", "ctx_upgrade"]);
++
++export function destructivePolicyAllows(name: string): boolean {
++  if (!DESTRUCTIVE_TOOLS.has(name)) return true;
++  const flag = (process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE ?? "").trim().toLowerCase();
++  return flag === "1" || flag === "true" || flag === "yes";
++}
++
++/** OpenCode 2's `ToolExecuteBefore` / `ToolExecuteCompleted` fields this file reads. */
++interface ToolHookEvent {
++  tool?: string;
++  input?: unknown;
++  sessionID?: string;
++  callID?: string;
++  agent?: unknown;
++  status?: string;
++  result?: unknown;
++  error?: { message?: string };
++}
++
++/** OpenCode 2's `SessionHookEvent` fields this file reads. */
++interface SessionHookEvent {
++  sessionID?: string;
++  prompt?: { text?: string };
++  system?: Array<{ type?: string; text?: string }>;
++  result?: { summary?: string };
++  metadata?: Record<string, unknown>;
++}
++
++function textOf(part: unknown): string {
++  if (typeof part === "string") return part;
++  const text = (part as { text?: unknown } | undefined)?.text;
++  return typeof text === "string" ? text : "";
++}
+ 
+ /** impl/12 §4.1: OpenCode 2.x plugin API `{id, setup}`; id reuses SERVER_KEY (A28). */
+ export const id = PLUGIN_ID;
+ 
+-/** impl/12 §4.3. Registers the ctx_* tools once and returns the hook object, closed over `cwd`. */
+-export async function setup(app: OpenCodeApp) {
+-  const cwd = app.directory; // §4.2 step 2: read once per plugin load
++/**
++ * impl/12 §4.3. Registers the ctx_* tools and the session/tool hooks, then returns the cleanup
++ * function OpenCode awaits on unload.
++ */
++export async function setup(ctx: OpenCodeV2Context): Promise<(() => Promise<void>) | void> {
++  const cwd = ctx?.location?.directory ?? process.cwd(); // §4.3 step 1: ctx.location.directory
+   const env = process.env;
+-  const turns = new Map<string, number>(); // sessionID -> turn, counted by chat.message
++  const turns = new Map<string, number>(); // sessionID -> turn, counted by the prompt hook
+   const payloads = new Map<string, Promise<string>>(); // sessionID -> fixed system payload (§4.6 step 4)
+ 
+   const call = (raw: Record<string, unknown>): Promise<HookOutput> =>
+@@ -55,88 +154,231 @@ export async function setup(app: OpenCodeApp) {
+   }
+ 
+   function project(): ProjectContext {
+-    return resolveProject(AGENT, { env, argv: process.argv, cwd: cwd ?? "" });
++    return resolveProject(AGENT, { env, argv: process.argv, cwd });
+   }
+ 
+-  // #1171: every ctx_* tool registers through the host's tool API; the handler is the same TOOLS
+-  // entry the MCP server calls (impl/12 §1).
+-  for (const tool of TOOLS) {
+-    app.tool(tool.name, {
+-      description: tool.description,
+-      args: tool.schema,
+-      async execute(args, toolCtx) {
+-        const parsed = tool.schema.safeParse(args);
+-        if (!parsed.success) return parsed.error.message;
+-        const sessionId = toolCtx.sessionID ?? "";
+-        let resolved: ProjectContext | undefined;
+-        const ctx: ToolContext = {
+-          get project(): ProjectContext {
+-            resolved ??= project();
+-            return resolved;
+-          },
+-          sessionId,
+-          turn: turnOf(sessionId),
+-          signal: toolCtx.abort ?? new AbortController().signal,
+-          protocolVersion: "",
+-        };
+-        try {
+-          return (await tool.handler(parsed.data, ctx)).text;
+-        } catch (err) {
+-          return err instanceof CtxError ? err.toLine() : INTERNAL_ERROR_LINE;
+-        }
+-      },
+-    });
+-  }
++  // Every hook/transform registration returns a `Registration` per the SDK — collect them so setup
++  // failure AND plugin cleanup release what was acquired instead of leaking stale hooks into the host.
++  const disposers: Array<() => Promise<void> | void> = [];
++  const track = (reg: unknown): void => {
++    const dispose = (reg as { dispose?: unknown } | undefined)?.dispose;
++    if (typeof dispose === "function") disposers.push(dispose as () => Promise<void> | void);
++  };
++  const teardown = async (): Promise<void> => {
++    for (const dispose of disposers.splice(0)) {
++      try {
++        await dispose();
++      } catch {
++        // Best-effort teardown — never break cleanup.
++      }
++    }
++  };
+ 
+-  return {
+-    // UserPromptSubmit; also the turn counter step-finish and tool calls read (D-M5-P2-2).
+-    "chat.message": async (input: { sessionID?: string }, output: { parts?: TextPart[] }) => {
+-      const sessionId = input.sessionID ?? "";
+-      turns.set(sessionId, turnOf(sessionId) + 1);
+-      const message = (output.parts ?? []).filter((p) => p.type === "text").map((p) => p.text ?? "").join("");
+-      await call({ type: "prompt", sessionID: sessionId, message, turn: turnOf(sessionId) });
+-    },
++  // Compaction posture from the V2 plugin's `options.compaction` (ported from
++  // mksglu/context-mode#1194): "own" (default) makes the state block the compaction summary and
++  // skips the host's model summarization call; "passthrough" leaves `result` unset.
++  const compactionMode = resolveCompactionMode(ctx?.options?.compaction);
+ 
+-    // §4.4. Deny (exit 2) throws with the reason; the reason carries any rewritten command (Q3, D-M5-P2-3).
+-    "tool.execute.before": async (input: ToolInput, output: { args?: unknown }) => {
+-      const sessionId = input.sessionID ?? "";
+-      await payloadFor(sessionId);
++  const usageController = new AbortController();
++
++  // ── tool registration ───────────────────────────────────────────────────
++  // #1171: every ctx_* tool registers through the host's tool-transform API; the handler is the same
++  // TOOLS entry the MCP server calls (impl/12 §1).
++  //
++  // Two V2-specific details, both observed on OpenCode 2.0.7:
++  // - Tools added via `editor.add` default to `codemode: true`, which hides them from the model's
++  //   direct tool list. Routing enforcement tells the model to *call* these tools directly, so they
++  //   are registered with `codemode: false`.
++  // - `editor.add` takes a JSON Schema, not a Zod shape; v2's schemas are already zod v4, so
++  //   `z.toJSONSchema` is the whole conversion.
++  track(
++    await ctx.tool.transform((editor) => {
++      for (const tool of TOOLS) {
++        editor.add({
++          name: tool.name,
++          description: tool.description,
++          input: z.toJSONSchema(tool.schema),
++          options: { codemode: false },
++          async execute(input: unknown, toolCtx: { signal?: AbortSignal; sessionID?: string }) {
++            if (!destructivePolicyAllows(tool.name)) {
++              // Context-mode-owned refusal — the V2 host cannot gate plugin tools per call, so this
++              // decision is ours, never a host permission denial.
++              throw new Error(
++                `ctx tool "${tool.name}" is disabled by context-mode policy. ` +
++                  `Set CONTEXT_MODE_ALLOW_DESTRUCTIVE=1 to enable.`,
++              );
++            }
++            const parsed = tool.schema.safeParse(input);
++            if (!parsed.success) {
++              const issue = parsed.error.issues[0];
++              const field = issue.path.length === 0 ? tool.name : issue.path.map(String).join(".");
++              return { content: formatError("INVALID_ARGS", { field, action: issue.message }) };
++            }
++            // OpenCode 2 does not document a session id on the tool execute context; when the host
++            // supplies one it is used, otherwise the call is recorded as session-less.
++            const sessionId = toolCtx?.sessionID ?? "";
++            const ctxForTool: ToolContext = {
++              get project(): ProjectContext {
++                return project();
++              },
++              sessionId,
++              turn: turnOf(sessionId),
++              signal: toolCtx?.signal ?? new AbortController().signal,
++              protocolVersion: "",
++            };
++            try {
++              const reply = await tool.handler(parsed.data, ctxForTool);
++              if (reply.isError) throw new Error(reply.text);
++              return { content: reply.text };
++            } catch (err) {
++              if (err instanceof CtxError) return { content: err.toLine() };
++              throw err instanceof Error ? err : new Error(INTERNAL_ERROR_LINE);
++            }
++          },
++        });
++      }
++    }),
++  );
++
++  // ── tool.execute.before → routing enforcement ───────────────────────────
++  track(
++    await ctx.tool.hook("execute.before", async (event: unknown) => {
++      const e = (event ?? {}) as ToolHookEvent;
++      const sessionId = e.sessionID ?? "";
+       const out = await call({
+-        type: "execute.before", sessionID: sessionId, tool: input.tool, callID: input.callID, args: output.args,
++        type: "execute.before",
++        sessionID: sessionId,
++        tool: e.tool ?? "",
++        callID: e.callID,
++        args: e.input ?? {},
+         turn: turnOf(sessionId),
+       });
+-      if (out.exitCode === 2) throw new Error(out.stdout);
+-    },
++      if (out.exitCode === 2) {
++        // A deny rule rejects with the reason, so the model sees it and continues.
++        throw new Error(out.stdout);
++      }
++    }),
++  );
+ 
+-    // §4.5. OpenCode's encode has no replace field (impl/10 §11), so output.output is never changed here.
+-    "tool.execute.after": async (input: ToolInput, output: { output?: unknown }) => {
+-      const sessionId = input.sessionID ?? "";
+-      await payloadFor(sessionId);
++  // ── tool.execute.after → session event capture ──────────────────────────
++  track(
++    await ctx.tool.hook("execute.after", async (event: unknown) => {
++      const e = (event ?? {}) as ToolHookEvent;
++      const sessionId = e.sessionID ?? "";
++      const isError = e.status === "error";
++      const output = isError
++        ? String(e.error?.message ?? "")
++        : typeof e.result === "string"
++          ? e.result
++          : Array.isArray((e.result as { content?: unknown[] } | undefined)?.content)
++            ? ((e.result as { content: Array<{ type?: string; text?: string }> }).content)
++                .filter((c) => c?.type === "text" && typeof c.text === "string")
++                .map((c) => c.text)
++                .join("\n")
++            : JSON.stringify(e.result ?? "");
+       await call({
+-        type: "execute.after", sessionID: sessionId, tool: input.tool, callID: input.callID, args: input.args,
+-        output: output.output, turn: turnOf(sessionId),
++        type: "execute.after",
++        sessionID: sessionId,
++        tool: e.tool ?? "",
++        args: e.input ?? {},
++        output,
++        isError,
++        turn: turnOf(sessionId),
+       });
+-    },
+-
+-    // §4.6: one system entry per session, the same bytes on every request (#1085, Q12). A second
+-    // transform on the same array finds the entry and adds nothing.
+-    "experimental.chat.system.transform": async (input: { sessionID?: string }, output: { system: string[] }) => {
+-      const payload = await payloadFor(input.sessionID ?? "");
+-      if (!output.system.includes(payload)) output.system.push(payload);
+-    },
+-
+-    // PreCompact: handleHook sets the pending-compact marker the next session payload reads (§4.6 step 2).
+-    "experimental.session.compacting": async (input: { sessionID?: string }) => {
+-      const sessionId = input.sessionID ?? "";
++    }),
++  );
++
++  // ── ctx.event.subscribe → per-step cost row ────────────────────────────
++  // OpenCode 2's bus carries `session.step.ended` for a finished model step; the legacy
++  // `message.part.updated` path is kept as a fallback for hosts that still emit it (note: it is
++  // absent from the v2 bus schema, so on OpenCode 2 the step event above is the live path).
++  void (async () => {
++    try {
++      for await (const busEvent of ctx.event.subscribe({ signal: usageController.signal }) as AsyncIterable<never>) {
++        try {
++          const b = busEvent as { type?: string; data?: { sessionID?: string }; properties?: { part?: { type?: string; sessionID?: string } } };
++          if (b?.type === "session.step.ended") {
++            const sessionId = b.data?.sessionID ?? "";
++            if (!sessionId) continue;
++            await call({ type: "step-finish", sessionID: sessionId, turn: turnOf(sessionId) });
++            continue;
++          }
++          if (b?.type !== "message.part.updated") continue;
++          const part = b.properties?.part;
++          if (part?.type !== "step-finish") continue;
++          const sessionId = part.sessionID ?? "";
++          if (!sessionId) continue;
++          await call({ type: "step-finish", sessionID: sessionId, turn: turnOf(sessionId) });
++        } catch {
++          // Silent — usage capture must never break the session.
++        }
++      }
++    } catch {
++      // Stream aborted on cleanup, or the connection dropped — nothing to do.
++    }
++  })();
++
++  // ── chat.message → session "prompt" hook ────────────────────────────────
++  track(
++    await ctx.session.hook("prompt", async (event: unknown) => {
++      const e = (event ?? {}) as SessionHookEvent;
++      const sessionId = e.sessionID ?? "";
++      turns.set(sessionId, turnOf(sessionId) + 1);
++      const message = e.prompt?.text ?? "";
++      await call({ type: "prompt", sessionID: sessionId, message, turn: turnOf(sessionId) });
++    }),
++  );
++
++  // ── experimental.session.compacting → session "compaction" hook ─────────
++  // "own" (default, ported from mksglu/context-mode#1194): supplying `result` makes the state block
++  // the compaction summary and the host skips its model summarization call entirely. "passthrough":
++  // `result` stays unset so the host model narrates. An empty summary leaves `result` unset in
++  // either mode so the host performs its normal compaction.
++  track(
++    await ctx.session.hook("compaction", async (event: unknown) => {
++      const e = (event ?? {}) as SessionHookEvent;
++      const sessionId = e.sessionID ?? "";
+       await call({ type: "compaction", sessionID: sessionId, turn: turnOf(sessionId) });
+-    },
+-
+-    // step-finish is the Usage event (D-M5-arch-2): one cost row per (session, turn), deduped by the store.
+-    event: async ({ event }: { event: BusEvent }) => {
+-      const part = event.properties?.part;
+-      if (event.type !== "message.part.updated" || part?.type !== "step-finish") return;
+-      const sessionId = part.sessionID ?? "";
+-      await call({ type: "step-finish", sessionID: sessionId, turn: turnOf(sessionId) });
+-    },
++      if (compactionMode !== "own") return;
++      try {
++        const summary = await compactionSummary(project(), sessionId, turnOf(sessionId));
++        if (summary.trim().length > 0) e.result = { summary };
++      } catch {
++        // Silent — never break compaction.
++      }
++    }),
++  );
++
++  // ── experimental.chat.system.transform → session "context" hook ─────────
++  // #1085: the payload merges into the existing system entry. OpenCode 2's `system` is a
++  // SystemPart[]; adding a part would split the cached system block and invalidate the provider's
++  // prompt cache, so the text is appended to the last text part instead (system.length unchanged).
++  track(
++    await ctx.session.hook("context", async (event: unknown) => {
++      const e = (event ?? {}) as SessionHookEvent;
++      const sessionId = e.sessionID ?? "";
++      const system = e.system;
++      if (!Array.isArray(system)) return;
++      const payload = await payloadFor(sessionId);
++      if (payload === "") return;
++      if (system.some((part) => textOf(part).endsWith(payload))) return; // already delivered
++      const last = system[system.length - 1];
++      if (last !== undefined && textOf(last) !== "") {
++        last.text = textOf(last) + "\n\n" + payload;
++      } else {
++        system.push({ type: "text", text: payload });
++      }
++    }),
++  );
++
++  return async () => {
++    usageController.abort();
++    await teardown();
+   };
+ }
++
++/**
++ * The plugin definition OpenCode 2 loads: a default export with `id` and `setup`. The V2 loader
++ * reads `id` and `setup()` off the default export and ignores anything else on it.
++ */
++export default { id, setup };
+diff --git a/tests/v2/plugins/opencode.test.mjs b/tests/v2/plugins/opencode.test.mjs
+index 4f3ff97c..d8e0e084 100644
+--- a/tests/v2/plugins/opencode.test.mjs
++++ b/tests/v2/plugins/opencode.test.mjs
+@@ -1,42 +1,196 @@
+ // tests/v2/plugins/opencode.test.mjs
+-// Spec: docs/v2/impl/12-plugins.md, §1a nativeTools filtering (DECISIONS-r9 R4).
+-// 14a: opencode-v2-plugin-api (#1199) default export has id + setup; opencode2-plugin-dual-export
+-// (#1171) ctx_* tools register successfully; opencode-single-system-message (#1085).
+-import { test } from "node:test";
++// Spec: docs/v2/impl/12-plugins.md §4 (src/entries/opencode.ts — the OpenCode 2 plugin).
++//
++// OpenCode 2's plugin API is a default export `{id, setup}` whose setup(ctx) registers hooks,
++// transforms and tools *through the plugin context*. It does not read a V1-shaped hook map off the
++// return value, and it has no `app.tool()` method: the V1 hook names do not exist in v2
++// (opencode@1438073 packages/plugin/src/promise/session.ts:138-151 — SessionHooks = prompt, context,
++// compaction; promise/tool.ts:38-64 — ToolHooks = execute.before, execute.after;
++// tickets/spike-hooks-verified.md:47 "v1 names are absent from v2 core").
++//
++// These cases pin the V2 surface, the compaction ownership port (mksglu/context-mode#1194) and the
++// destructive-tool policy port.
++import { test, before, after } from "node:test";
+ import assert from "node:assert/strict";
++import { execFileSync } from "node:child_process";
++import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
+ 
+ import * as opencodePlugin from "../../../src/entries/opencode.ts";
+ 
++let root;
++let repo;
++let oldHome;
++
++// The journal write is detached (A21), so a row lands a tick after the hook returns.
++const settle = () => new Promise((r) => setTimeout(r, 250));
++
++/** A fake OpenCode 2 plugin context that records what the entry registers. */
++function fakeCtx(options = {}) {
++  const sessionHooks = new Map();
++  const toolHooks = new Map();
++  const tools = [];
++  const ctx = {
++    location: { directory: repo },
++    options,
++    session: {
++      hook: async (name, cb) => {
++        sessionHooks.set(name, cb);
++        return { dispose: async () => {} };
++      },
++    },
++    tool: {
++      hook: async (name, cb) => {
++        toolHooks.set(name, cb);
++        return { dispose: async () => {} };
++      },
++      transform: async (cb) => {
++        cb({
++          add: (def) => {
++            tools.push(def);
++          },
++        });
++        return { dispose: async () => {} };
++      },
++    },
++    event: {
++      subscribe: () => ({
++        async *[Symbol.asyncIterator]() {
++          // no events
++        },
++      }),
++    },
++  };
++  return { ctx, sessionHooks, toolHooks, tools };
++}
++
++before(() => {
++  root = mkdtempSync(join(tmpdir(), "cm-opencode-v2-"));
++  repo = join(root, "repo");
++  mkdirSync(repo);
++  execFileSync("git", ["init", "-q", repo]);
++  oldHome = process.env.HOME;
++  process.env.HOME = root; // resolveConfigDir reads the process env (D-M1-T3-5)
++});
++
++after(() => {
++  process.env.HOME = oldHome;
++  try {
++    rmSync(root, { recursive: true, force: true, maxRetries: 3 });
++  } catch (err) {
++    if (process.platform !== "win32" || err.code !== "EPERM") throw err;
++  }
++});
++
+ test("[M5] plugins/opencode-v2-plugin-api: default export has an id and a setup function (#1199)", () => {
+-  const mod = opencodePlugin.default ?? opencodePlugin;
+-  assert.equal(typeof mod.id, "string");
+-  assert.equal(typeof mod.setup, "function");
++  assert.ok(opencodePlugin.default, "the entry must have a default export — the V2 loader reads id/setup off it");
++  assert.equal(typeof opencodePlugin.default.id, "string");
++  assert.equal(typeof opencodePlugin.default.setup, "function");
+ });
+ 
+-test("[M5] plugins/opencode2-plugin-dual-export: the ctx_* tools register successfully (#1171)", async () => {
+-  const mod = opencodePlugin.default ?? opencodePlugin;
+-  const registered = [];
+-  const ctx = { tool: (name, _def) => registered.push(name) };
+-  await mod.setup(ctx);
+-  assert.ok(registered.some((n) => n.startsWith("ctx_")), "at least one ctx_* tool must register");
++test("[M5] plugins/opencode-v2-plugin-api: the ctx_* tools register through ctx.tool.transform (#1171)", async () => {
++  const { ctx, tools } = fakeCtx();
++  await opencodePlugin.default.setup(ctx);
++  assert.ok(tools.length > 0, "at least one ctx_* tool must register");
++  for (const def of tools) {
++    assert.match(def.name, /^ctx_/, `tool name must be a native ctx_* name, got ${def.name}`);
++    assert.equal(def.options?.codemode, false, "codemode must be false so the model can call the tool directly");
++    assert.equal(typeof def.input, "object", "the tool must declare a JSON Schema input");
++  }
+ });
+ 
+-test("[M5] plugins/opencode-single-system-message: SessionStart lines merge into one output.system entry (#1085)", async () => {
+-  const mod = opencodePlugin.default ?? opencodePlugin;
+-  let systemMessages = [];
+-  const hooks = {};
+-  const ctx = {
+-    tool: () => {},
+-    event: (name, fn) => { hooks[name] = fn; },
+-  };
+-  await mod.setup(ctx);
+-  const before = { system: [] };
+-  if (hooks["chat.system.transform"]) {
+-    await hooks["chat.system.transform"]({}, before);
++test("[M5] plugins/opencode-v2-plugin-api: the hooks register under the v2 names, not the v1 ones", async () => {
++  const { ctx, sessionHooks, toolHooks } = fakeCtx();
++  await opencodePlugin.default.setup(ctx);
++  assert.deepEqual([...sessionHooks.keys()].sort(), ["compaction", "context", "prompt"]);
++  assert.deepEqual([...toolHooks.keys()].sort(), ["execute.after", "execute.before"]);
++  // The v1 names are absent from v2 core (spike-hooks-verified.md:47); registering them is a no-op.
++  const v1Names = ["chat.message", "tool.execute.before", "tool.execute.after", "experimental.session.compacting", "experimental.chat.system.transform"];
++  for (const name of v1Names) {
++    assert.equal(sessionHooks.has(name), false, `${name} is not a v2 hook name`);
++    assert.equal(toolHooks.has(name), false, `${name} is not a v2 hook name`);
+   }
+-  const lenBefore = before.system.length;
+-  if (hooks["chat.system.transform"]) {
+-    await hooks["chat.system.transform"]({}, before);
++});
++
++test("[M5] plugins/opencode-v2-plugin-api: the setup returns a cleanup that disposes the registrations", async () => {
++  const { ctx } = fakeCtx();
++  const cleanup = await opencodePlugin.default.setup(ctx);
++  assert.equal(typeof cleanup, "function", "setup must return the unload cleanup OpenCode awaits");
++  await cleanup();
++});
++
++test("[M5] plugins/opencode-compaction-ownership: 'own' mode supplies the summary so the host skips its own summarization (#1194)", async () => {
++  const { ctx, sessionHooks } = fakeCtx({ compaction: "own" });
++  await opencodePlugin.default.setup(ctx);
++  // A prompt row gives the session something to summarise.
++  await sessionHooks.get("prompt")({ sessionID: "s-own", prompt: { text: "summarise this" } });
++  await settle(); // the journal write is detached (A21)
++  const event = { sessionID: "s-own", system: [] };
++  await sessionHooks.get("compaction")(event);
++  assert.ok(event.result, "own mode must set event.result");
++  assert.equal(typeof event.result.summary, "string");
++  assert.ok(event.result.summary.length > 0, "own mode must supply a non-empty summary");
++});
++
++test("[M5] plugins/opencode-compaction-ownership: 'passthrough' mode leaves the summary to the host (#1194)", async () => {
++  const { ctx, sessionHooks } = fakeCtx({ compaction: "passthrough" });
++  await opencodePlugin.default.setup(ctx);
++  await sessionHooks.get("prompt")({ sessionID: "s-pass", prompt: { text: "summarise this" } });
++  const event = { sessionID: "s-pass", system: [] };
++  await sessionHooks.get("compaction")(event);
++  assert.equal(event.result, undefined, "passthrough mode must leave result unset so the host model narrates");
++});
++
++test("[M5] plugins/opencode-compaction-ownership: an empty session leaves the summary to the host (#1194)", async () => {
++  const { ctx, sessionHooks } = fakeCtx({ compaction: "own" });
++  await opencodePlugin.default.setup(ctx);
++  const event = { sessionID: "s-empty", system: [] };
++  await sessionHooks.get("compaction")(event);
++  assert.equal(event.result, undefined, "an empty session must not suppress the host's own summarization");
++});
++
++test("[M5] plugins/opencode-destructive-policy: ctx_purge is refused unless the policy flag is set (#1194)", async () => {
++  const { ctx, tools } = fakeCtx();
++  await opencodePlugin.default.setup(ctx);
++  const purge = tools.find((t) => t.name === "ctx_purge");
++  assert.ok(purge, "ctx_purge must be registered");
++  await assert.rejects(
++    () => purge.execute({}, { signal: undefined }),
++    /CONTEXT_MODE_ALLOW_DESTRUCTIVE/,
++    "a destructive tool must refuse by default",
++  );
++});
++
++test("[M5] plugins/opencode-destructive-policy: the policy helper allows non-destructive tools and honours the flag", () => {
++  const prev = process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
++  delete process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
++  try {
++    assert.equal(opencodePlugin.destructivePolicyAllows("ctx_search"), true);
++    assert.equal(opencodePlugin.destructivePolicyAllows("ctx_purge"), false);
++    assert.equal(opencodePlugin.destructivePolicyAllows("ctx_upgrade"), false);
++    process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE = "1";
++    assert.equal(opencodePlugin.destructivePolicyAllows("ctx_purge"), true);
++    assert.equal(opencodePlugin.destructivePolicyAllows("ctx_upgrade"), true);
++  } finally {
++    if (prev === undefined) delete process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
++    else process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE = prev;
+   }
+-  assert.equal(before.system.length, lenBefore, "multiple SessionStart-equivalent lines must merge into one output.system entry");
++});
++
++test("[M5] plugins/opencode-compaction-mode: the mode resolver defaults to own and reads the host alias", () => {
++  assert.equal(opencodePlugin.resolveCompactionMode(undefined), "own");
++  assert.equal(opencodePlugin.resolveCompactionMode("own"), "own");
++  assert.equal(opencodePlugin.resolveCompactionMode("passthrough"), "passthrough");
++  assert.equal(opencodePlugin.resolveCompactionMode("host"), "passthrough");
++});
++
++test("[M5] plugins/opencode-v2-plugin-api: the entry never touches context.db directly", () => {
++  const src = opencodePlugin.setup.toString();
++  assert.ok(!/better-sqlite3|openDb\(/.test(src), "opencode.ts must route all db access through core, not open the db itself");
++});
++
++test("[M5] plugins/opencode-v2-plugin-api: the entry does not call the v1 app.tool() API", () => {
++  const src = opencodePlugin.setup.toString();
++  assert.ok(!/\bapp\.tool\b/.test(src), "OpenCode 2 has no app.tool(); tools register through ctx.tool.transform");
+ });
+-- 
+2.53.0
+
